@@ -1,0 +1,35 @@
+[project]
+name = "server-backup-scripts"
+description = "A set of tooling for backing up my server(s)"
+dynamic = ["version"]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">= 3.12"
+authors = [
+  {name = "AJ Fite", email = "me@ajfite.com"},
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "flake8",
+    "flake8-bugbear",
+    "black",
+    "isort",
+]
+
+[project.scripts]
+backup = "backup:main"
+
+[project.urls]
+Repository = "https://git.nclf.net/ajfite/server-backup-scripts.git"
+
+[tool.isort]
+profile = "black"
+
+[tool.setuptools_scm]
+
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
