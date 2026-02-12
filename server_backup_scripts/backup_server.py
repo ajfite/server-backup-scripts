@@ -49,4 +49,4 @@ class DirManager:
 
 
 if __name__ == "__main__":
-    main()  # noqa: E1120 Click will handle this for us
+    main()
