@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-backup = "backup:main"
+backup = "server_backup_scripts.backup_server:main"
 
 [project.urls]
 Repository = "https://git.nclf.net/ajfite/server-backup-scripts.git"
