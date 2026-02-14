@@ -10,6 +10,7 @@ authors = [
 ]
 dependencies = [
   "click~=8.3",
+  "loguru",
 ]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
@@ -27,6 +28,11 @@ dev = [
   "flake8",
   "flake8-bugbear",
   "flake8-black",
+  "flake8-builtins",
+  "flake8-comprehensions",
+  "flake8-isort",
+  "flake8-gl-codeclimate",
+  "pep8-naming",
   "black~=26.1",
   "isort",
 ]
@@ -45,6 +51,9 @@ Repository = "https://git.nclf.net/ajfite/server-backup-scripts.git"
 profile = "black"
 
 [tool.setuptools_scm]
+
+[tool.setuptools]
+packages = ["server_backup_scripts"]
 
 [build-system]
 requires = ["setuptools>=80", "setuptools-scm>=8"]
