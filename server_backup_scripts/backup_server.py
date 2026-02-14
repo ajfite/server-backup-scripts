@@ -20,6 +20,7 @@ GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
     default=DEFAULT_BACKUP_DIR,
     help="backup directory that should be managed",
 )
+@logger.catch
 def main(backup_dir: str):
     logger.add(f"{backup_dir}/backup_service.log", rotation="100 KB")
     logger.info(f"Managing backups at@: {backup_dir}")

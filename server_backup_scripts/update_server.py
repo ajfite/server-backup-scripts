@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 
+import click
+from loguru import logger
 
+
+@click.command()
+@logger.catch
 def main():
-    print("Hello World")
+    logger.info("Running update service")
 
 
-class update:
+class Update:
     def vaultwarden(self):
         pass
 
