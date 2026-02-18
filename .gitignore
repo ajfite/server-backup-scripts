@@ -5,3 +5,4 @@ build/
 .mypy_cache/
 *.log
 dummy/
+.DS_Store
