@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
+import bz2
 import os
+import time
 
 import click
 from loguru import logger
 import shutil
 
 from .file_utils import get_most_recent_files
-from .process_utils import run_process_with_logging
+from .process_utils import run_process_with_stdout
 
 DEFAULT_BACKUP_DIR: str = "/opt/backup-management"
 GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
-
+DATETIME_STR: str = time.strftime("%Y%m%d-%H%M%S%z", time.gmtime())
 
 @click.command()
 @click.option(
@@ -78,12 +80,22 @@ class Collect:
 
     def gitlab(self):
         logger.info("Running Gitlab backup")
-        run_process_with_logging(["gitlab-backup", "create"])
+        # force a manual backup
+        log, _ = run_process_with_stdout(["gitlab-backup", "create"])
+        logger.info(log)
         backup = get_most_recent_files(GITLAB_BACKUP_DIR, 1)
         shutil.copy(backup[0], f"{self.backup_dir}/gitlab")
 
     def postgres(self):
-        pass
+        # pg_dumpall doesn't require the server to be stopped per docs
+        # to get a good backup
+        out, _ = run_process_with_stdout(["pg_dumpall", "-U", "postgres"])
+        compressed = bz2.compress(out.encode("utf-8"))
+        with open(
+            f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
+            "wb",
+        ) as f:
+            f.write(compressed)
 
     def vaultwarden(self):
         pass
