@@ -12,8 +12,13 @@ from .process_utils import run_process_with_stdout
 
 DEFAULT_BACKUP_DIR: str = "/opt/backup-management"
 GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
+VAULTWARDEN_BACKUP_DIR: str = "/opt/docker/vaultwarden/vw-data"
 DATETIME_STR: str = time.strftime("%Y%m%d-%H%M%S%z", time.gmtime())
 
+
+# TODO: Big caveat - I'm currently assuming that the commands just work
+# aside from logging failures I'm doing nothing about them
+# Should handle and alert failures, email probably
 @click.command()
 @click.option(
     "-d",
@@ -96,9 +101,60 @@ class Collect:
             "wb",
         ) as f:
             f.write(compressed)
+            logger.info(f"Wrote Postgres backup to {f.name}")
 
     def vaultwarden(self):
-        pass
+        # Backup database
+        # docker exec -it vaultwarden /vaultwarden backup
+        logger.info("Backing up Vaultwarden")
+        logger.info("Generating sqlite backup")
+        out, _ = run_process_with_stdout(
+            ["docker", "exec", "-it", "vaultwarden", "/vaultwarden", "backup"]
+        )
+        logger.info(out)
+
+        sqlite_backup = get_most_recent_files(
+            count=1, path=VAULTWARDEN_BACKUP_DIR, glob_str="*.sqlite3"
+        )
+
+        with open(sqlite_backup[0], "rb") as f:
+            compressed = bz2.compress(f.read())
+            with open(
+                f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.sqlite3.bz2",
+                "wb",
+            ) as g:
+                g.write(compressed)
+                logger.info(f"Wrote Vaultwarden backup to {g.name}")
+
+        os.remove(sqlite_backup[0])
+
+        try:
+            logger.info("Creating Vaultwarden sends directory in case it doesn't exist")
+            os.mkdir(f"{VAULTWARDEN_BACKUP_DIR}/sends")
+        except FileExistsError:
+            logger.info("Sends directory exists!")
+
+        # Backup attachments dir
+        # Backup sends dir
+        # Backup config.json
+        # Backup rsa_key*
+        vaultwarden_backup_file = (
+            "{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.bz2"
+        )
+        out, _ = run_process_with_stdout(
+            [
+                "tar",
+                "-cjv",
+                f'--file="{vaultwarden_backup_file}"',
+                f'--directory="{VAULTWARDEN_BACKUP_DIR}"',
+                "attachments",
+                "config.json",
+                "rsa_key*",
+                "sends",
+            ]
+        )
+        logger.info(out)
+        logger.info(f"backed up Vaultwarden to {vaultwarden_backup_file}")
 
     def etc(self):
         pass
