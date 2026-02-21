@@ -38,6 +38,7 @@ def main(backup_dir: str):
     collector.vaultwarden()
     collector.etc()
     collector.mariadb()
+    collector.amp()
 
 
 class Collect:
