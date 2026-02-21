@@ -95,7 +95,7 @@ class Collect:
     def postgres(self):
         # pg_dumpall doesn't require the server to be stopped per docs
         # to get a good backup
-        out, _ = run_process_with_stdout(["pg_dumpall", "-U", "postgres"])
+        out, _ = run_process_with_stdout(["sudo", "-u", "postgres", "pg_dumpall"])
         compressed = bz2.compress(out.encode("utf-8"))
         with open(
             f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
