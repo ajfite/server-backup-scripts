@@ -11,6 +11,7 @@ authors = [
 dependencies = [
   "click~=8.3",
   "loguru",
+  "zstd",
 ]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
