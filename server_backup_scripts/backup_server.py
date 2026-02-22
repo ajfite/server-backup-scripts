@@ -33,7 +33,7 @@ def main(backup_dir: str):
     logger.info(f"Managing backups at@: {backup_dir}")
 
     collector = Collect(backup_dir)
-    collector.gitlab()
+    #collector.gitlab()
     collector.postgres()
     collector.vaultwarden()
     collector.etc()
@@ -97,14 +97,7 @@ class Collect:
         # to get a good backup
         run_process_with_stdout(
             [
-                "sudo",
-                "-u",
-                "postgres",
-                "pg_dumpall",
-                "|",
-                "bzip2",
-                ">",
-                f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
+                f"sudo -u postgres pg_dumpall | bzip2 > {self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
             ],
             True,
         )
