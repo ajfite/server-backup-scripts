@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import bz2
+import zstd
 import os
 import time
 
@@ -33,7 +33,7 @@ def main(backup_dir: str):
     logger.info(f"Managing backups at@: {backup_dir}")
 
     collector = Collect(backup_dir)
-    #collector.gitlab()
+    # collector.gitlab()
     collector.postgres()
     collector.vaultwarden()
     collector.etc()
@@ -95,13 +95,15 @@ class Collect:
     def postgres(self):
         # pg_dumpall doesn't require the server to be stopped per docs
         # to get a good backup
-        run_process_with_stdout(
+        backup_location = f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.zst"
+        out, _ = run_process_with_stdout(
             [
-                f"sudo -u postgres pg_dumpall | bzip2 > {self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
+                f"sudo -u postgres pg_dumpall | zstd -o {backup_location}",
             ],
             True,
         )
-        logger.info(f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2")
+        logger.info(out)
+        logger.info(f"Wrote postgres backup to {backup_location}")
 
     def vaultwarden(self):
         # Backup database
@@ -118,9 +120,9 @@ class Collect:
         )
 
         with open(sqlite_backup[0], "rb") as f:
-            compressed = bz2.compress(f.read())
+            compressed = zstd.compress(f.read())
             with open(
-                f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.sqlite3.bz2",
+                f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.sqlite3.zst",
                 "wb",
             ) as g:
                 g.write(compressed)
@@ -139,12 +141,13 @@ class Collect:
         # Backup config.json
         # Backup rsa_key*
         vaultwarden_backup_file = (
-            "{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.bz2"
+            "{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.zst"
         )
         out, _ = run_process_with_stdout(
             [
                 "tar",
-                "-cjv",
+                "-cv",
+                "--zstd",
                 f'--file="{vaultwarden_backup_file}"',
                 f'--directory="{VAULTWARDEN_BACKUP_DIR}"',
                 "attachments",
