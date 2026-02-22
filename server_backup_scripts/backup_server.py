@@ -33,8 +33,8 @@ def main(backup_dir: str):
     logger.info(f"Managing backups at@: {backup_dir}")
 
     collector = Collect(backup_dir)
-    # collector.gitlab()
-    collector.postgres()
+    #collector.gitlab()
+    #collector.postgres()
     collector.vaultwarden()
     collector.etc()
     collector.mariadb()
