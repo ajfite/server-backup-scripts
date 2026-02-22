@@ -14,7 +14,8 @@ def run_process_with_stdout(cmd: list[str], shell: bool = False) -> tuple[str, i
     out, error = process.communicate()
     process.wait()
 
-    logger.error(error)
+    if len(error) > 0:
+        logger.error(error)
     logger.info(f"Completed {cmd} with status {process.returncode}")
 
     if process.returncode != 0:
