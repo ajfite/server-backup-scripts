@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import glob
+
 import zstd
 import os
 import time
@@ -33,8 +35,8 @@ def main(backup_dir: str):
     logger.info(f"Managing backups at@: {backup_dir}")
 
     collector = Collect(backup_dir)
-    #collector.gitlab()
-    #collector.postgres()
+    # collector.gitlab()
+    # collector.postgres()
     collector.vaultwarden()
     collector.etc()
     collector.mariadb()
@@ -143,19 +145,22 @@ class Collect:
         vaultwarden_backup_file = (
             f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.zst"
         )
-        out, _ = run_process_with_stdout(
-            [
-                "tar",
-                "-cv",
-                "--zstd",
-                f"--file={vaultwarden_backup_file}",
-                f"--directory={VAULTWARDEN_BACKUP_DIR}",
-                "attachments",
-                "config.json",
-                "rsa_key*",
-                "sends",
-            ]
+
+        cmd = [
+            "tar",
+            "-cv",
+            "--zstd",
+            f"--file={vaultwarden_backup_file}",
+            f"--directory={VAULTWARDEN_BACKUP_DIR}",
+            "attachments",
+            "config.json",
+            "sends",
+        ]
+        cmd.extend(
+            glob.glob("rsa_key*", recursive=True, root_dir=VAULTWARDEN_BACKUP_DIR)
         )
+
+        out, _ = run_process_with_stdout(cmd)
         logger.info(out)
         logger.info(f"backed up Vaultwarden to {vaultwarden_backup_file}")
 
