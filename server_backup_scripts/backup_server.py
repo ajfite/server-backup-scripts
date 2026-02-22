@@ -141,7 +141,7 @@ class Collect:
         # Backup config.json
         # Backup rsa_key*
         vaultwarden_backup_file = (
-            "{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.zst"
+            f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.zst"
         )
         out, _ = run_process_with_stdout(
             [
