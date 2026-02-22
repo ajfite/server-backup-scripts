@@ -95,14 +95,20 @@ class Collect:
     def postgres(self):
         # pg_dumpall doesn't require the server to be stopped per docs
         # to get a good backup
-        out, _ = run_process_with_stdout(["sudo", "-u", "postgres", "pg_dumpall"])
-        compressed = bz2.compress(out.encode("utf-8"))
-        with open(
-            f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
-            "wb",
-        ) as f:
-            f.write(compressed)
-            logger.info(f"Wrote Postgres backup to {f.name}")
+        run_process_with_stdout(
+            [
+                "sudo",
+                "-u",
+                "postgres",
+                "pg_dumpall",
+                "|",
+                "bzip2",
+                ">",
+                f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2",
+            ],
+            True,
+        )
+        logger.info(f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.bz2")
 
     def vaultwarden(self):
         # Backup database

@@ -2,10 +2,14 @@ import subprocess
 from loguru import logger
 
 
-def run_process_with_stdout(cmd: list[str]) -> tuple[str, int]:
+def run_process_with_stdout(cmd: list[str], shell: bool = False) -> tuple[str, int]:
     logger.info(f"Running {cmd}")
+
+    if shell:
+        logger.info("Shell mode is enabled for this command")
+
     process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell
     )
     out, error = process.communicate()
     process.wait()
