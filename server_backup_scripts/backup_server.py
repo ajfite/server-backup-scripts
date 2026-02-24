@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import glob
 
-import zstd
 import os
 import time
 
@@ -109,7 +108,6 @@ class Collect:
 
     def vaultwarden(self):
         # Backup database
-        # docker exec -it vaultwarden /vaultwarden backup
         logger.info("Backing up Vaultwarden")
         logger.info("Generating sqlite backup")
         out, _ = run_process_with_stdout(
@@ -117,26 +115,11 @@ class Collect:
         )
         logger.info(out)
 
-        sqlite_backup = get_most_recent_files(
-            count=1, path=VAULTWARDEN_BACKUP_DIR, glob_str="*.sqlite3"
-        )
-
-        with open(sqlite_backup[0], "rb") as f:
-            compressed = zstd.compress(f.read())
-            with open(
-                f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.sqlite3.zst",
-                "wb",
-            ) as g:
-                g.write(compressed)
-                logger.info(f"Wrote Vaultwarden backup to {g.name}")
-
-        os.remove(sqlite_backup[0])
-
         try:
             logger.info("Creating Vaultwarden sends directory in case it doesn't exist")
             os.mkdir(f"{VAULTWARDEN_BACKUP_DIR}/sends")
         except FileExistsError:
-            logger.info("Sends directory exists!")
+            logger.trace("Sends directory exists!")
 
         # Backup attachments dir
         # Backup sends dir
@@ -144,6 +127,11 @@ class Collect:
         # Backup rsa_key*
         vaultwarden_backup_file = (
             f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.zst"
+        )
+
+        # Determine most recent sqlite backup
+        sqlite_backup = get_most_recent_files(
+            count=1, path=VAULTWARDEN_BACKUP_DIR, glob_str="*.sqlite3"
         )
 
         cmd = [
@@ -155,6 +143,7 @@ class Collect:
             "attachments",
             "config.json",
             "sends",
+            sqlite_backup[0],
         ]
         cmd.extend(
             glob.glob("rsa_key*", recursive=True, root_dir=VAULTWARDEN_BACKUP_DIR)
@@ -162,6 +151,8 @@ class Collect:
 
         out, _ = run_process_with_stdout(cmd)
         logger.info(out)
+        os.remove(sqlite_backup[0])
+        logger.info(f"Removed sqlite backup at {sqlite_backup[0]}")
         logger.info(f"backed up Vaultwarden to {vaultwarden_backup_file}")
 
     def etc(self):
