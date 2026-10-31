@@ -1,50 +1,115 @@
 #!/usr/bin/env python3
 import glob
-
 import os
+import shutil
 import time
+from typing import Optional
 
 import click
 from loguru import logger
-import shutil
 
-from .file_utils import get_most_recent_files
+from .file_utils import (
+    get_backup_files,
+    get_most_recent_files,
+    link_file_space_efficient,
+    rotate_directory_backups,
+    set_permissions_and_owner,
+)
 from .process_utils import run_process_with_stdout
 
 DEFAULT_BACKUP_DIR: str = "/opt/backup-management"
+DEFAULT_EXPORT_DIR: str = "/home/backup-user/backups"
+DEFAULT_EXPORT_USER: str = "backup-user"
+DEFAULT_AMP_DIR: str = "/home/amp/.ampdata/instances"
+DEFAULT_KEEP: int = 5
 GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
 VAULTWARDEN_BACKUP_DIR: str = "/opt/docker/vaultwarden/vw-data"
-DATETIME_STR: str = time.strftime("%Y%m%d-%H%M%S%z", time.gmtime())
 
 
-# TODO: Big caveat - I'm currently assuming that the commands just work
-# aside from logging failures I'm doing nothing about them
-# Should handle and alert failures, email probably
+def get_datetime_str() -> str:
+    """Return formatted UTC datetime string."""
+    return time.strftime("%Y%m%d-%H%M%S%z", time.gmtime())
+
+
+DATETIME_STR: str = get_datetime_str()
+
+
 @click.command()
 @click.option(
     "-d",
     "--backup-dir",
     type=click.Path(),
     default=DEFAULT_BACKUP_DIR,
-    help="backup directory that should be managed",
+    help="Backup directory that should be managed",
+)
+@click.option(
+    "-e",
+    "--export-dir",
+    type=click.Path(),
+    default=DEFAULT_EXPORT_DIR,
+    help="Directory where backups are exported for non-root user",
+)
+@click.option(
+    "-u",
+    "--export-user",
+    type=str,
+    default=DEFAULT_EXPORT_USER,
+    help="Non-root user who needs access to the exported backups",
+)
+@click.option(
+    "-k",
+    "--keep",
+    type=int,
+    default=DEFAULT_KEEP,
+    help="Number of backups to keep per type during rotation",
+)
+@click.option(
+    "--amp-dir",
+    type=click.Path(),
+    default=DEFAULT_AMP_DIR,
+    help="Path to AMP instances directory",
+)
+@click.option(
+    "--skip-collect",
+    is_flag=True,
+    default=False,
+    help="Skip running collectors, only rotate and sync export directory",
 )
 @logger.catch
-def main(backup_dir: str):
+def main(
+    backup_dir: str,
+    export_dir: str,
+    export_user: str,
+    keep: int,
+    amp_dir: str,
+    skip_collect: bool,
+):
     logger.add(f"{backup_dir}/backup_service.log", rotation="100 KB")
-    logger.info(f"Managing backups at@: {backup_dir}")
+    logger.info(f"Managing backups at: {backup_dir}")
 
-    collector = Collect(backup_dir)
-    # collector.gitlab()
-    # collector.postgres()
-    collector.vaultwarden()
-    collector.etc()
-    collector.mariadb()
-    collector.amp()
+    collector = Collect(backup_dir=backup_dir, amp_dir=amp_dir)
+    if not skip_collect:
+        collector.gitlab()
+        collector.postgres()
+        collector.vaultwarden()
+        collector.etc()
+        collector.mariadb()
+        collector.amp()
+
+    rotator = Rotate(backup_dir=backup_dir, keep=keep)
+    rotator.rotate_all()
+
+    exporter = ExportManager(
+        backup_dir=backup_dir,
+        export_dir=export_dir,
+        export_user=export_user,
+    )
+    exporter.sync_all()
 
 
 class Collect:
     backup_dir: str
-    backups: list[str] = []
+    amp_dir: str
     standard_backup_types: list[str] = [
         "gitlab",
         "postgres",
@@ -56,22 +121,61 @@ class Collect:
         "amp",
     ]
 
-    def __init__(self, backup_dir: str):
+    def __init__(
+        self,
+        backup_dir: str = DEFAULT_BACKUP_DIR,
+        amp_dir: str = DEFAULT_AMP_DIR,
+    ):
         self.backup_dir = backup_dir
+        self.amp_dir = amp_dir
         self._create_directories()
         self._init_amp_links()
 
     def _init_amp_links(self):
-        # Assemble list of amp instances
-        # Go into each amp instance and link the Backups directory
-        # Delete any links for instances that don't exist
-        pass
+        """
+        Assemble list of amp instances, link each Backups directory into
+        self.backup_dir/amp, and prune broken links.
+        """
+        amp_target_dir = os.path.join(self.backup_dir, "amp")
+        if not os.path.isdir(self.amp_dir):
+            logger.info(
+                f"AMP instances dir not found at {self.amp_dir}, skipping link init"
+            )
+            return
+
+        for instance_name in os.listdir(self.amp_dir):
+            instance_path = os.path.join(self.amp_dir, instance_name)
+            backups_path = os.path.join(instance_path, "Backups")
+            if os.path.isdir(backups_path):
+                link_path = os.path.join(amp_target_dir, instance_name)
+                if os.path.islink(link_path):
+                    if os.readlink(link_path) == backups_path:
+                        continue
+                    os.unlink(link_path)
+                elif os.path.exists(link_path):
+                    logger.warning(f"Non-symlink file exists at {link_path}, skipping")
+                    continue
+
+                try:
+                    os.symlink(backups_path, link_path)
+                    logger.info(f"Linked AMP backups: {link_path} -> {backups_path}")
+                except OSError as e:
+                    logger.error(
+                        f"Failed to symlink AMP backups for {instance_name}: {e}"
+                    )
+
+        if os.path.isdir(amp_target_dir):
+            for entry in os.listdir(amp_target_dir):
+                entry_path = os.path.join(amp_target_dir, entry)
+                if os.path.islink(entry_path) and not os.path.exists(entry_path):
+                    logger.info(f"Removing stale AMP backup link: {entry_path}")
+                    os.unlink(entry_path)
 
     def _create_directories(self):
-        for backup_type in self.standard_backup_types + self.special_backup_types:
+        all_types = self.standard_backup_types + self.special_backup_types
+        for backup_type in all_types:
             path = f"{self.backup_dir}/{backup_type}"
 
-            # Check for backup path existence, create it if it doesn't exist
             if os.path.exists(path):
                 if os.path.isdir(path):
                     logger.info(f"Directory for {backup_type} already exists :)")
@@ -83,56 +187,85 @@ class Collect:
                     exit(100)
             else:
                 logger.info(f"Creating backup path for {backup_type}")
-                os.mkdir(f"{self.backup_dir}/{backup_type}")
+                os.makedirs(path, exist_ok=True)
 
-    def gitlab(self):
+    def gitlab(self) -> bool:
         logger.info("Running Gitlab backup")
-        # force a manual backup
-        log, _ = run_process_with_stdout(["gitlab-backup", "create"])
+        if not shutil.which("gitlab-backup") and not os.path.exists(
+            "/opt/gitlab/bin/gitlab-backup"
+        ):
+            logger.warning("gitlab-backup command not found, skipping Gitlab")
+            return False
+
+        log, code = run_process_with_stdout(["gitlab-backup", "create"])
         logger.info(log)
-        backup = get_most_recent_files(GITLAB_BACKUP_DIR, 1)
-        shutil.copy(backup[0], f"{self.backup_dir}/gitlab")
+        if code != 0:
+            logger.error("Gitlab backup creation failed")
+            return False
 
-    def postgres(self):
-        # pg_dumpall doesn't require the server to be stopped per docs
-        # to get a good backup
-        backup_location = f"{self.backup_dir}/postgres/{DATETIME_STR}-postgres.sql.zst"
-        out, _ = run_process_with_stdout(
-            [
-                f"sudo -u postgres pg_dumpall | zstd -o {backup_location}",
-            ],
-            True,
+        backups = get_most_recent_files(GITLAB_BACKUP_DIR, 1)
+        if not backups:
+            logger.error(f"No Gitlab backup files found in {GITLAB_BACKUP_DIR}")
+            return False
+
+        dest = os.path.join(self.backup_dir, "gitlab")
+        copied_file = shutil.copy(backups[0], dest)
+        set_permissions_and_owner(copied_file, mode=0o644)
+        logger.info(f"Copied Gitlab backup {backups[0]} to {dest}")
+        return True
+
+    def postgres(self) -> bool:
+        logger.info("Running PostgreSQL backup")
+        if not shutil.which("pg_dumpall"):
+            logger.warning("pg_dumpall not found, skipping PostgreSQL")
+            return False
+
+        ts = get_datetime_str()
+        backup_location = f"{self.backup_dir}/postgres/{ts}-postgres.sql.zst"
+        out, code = run_process_with_stdout(
+            [f"sudo -u postgres pg_dumpall | zstd -o {backup_location}"],
+            shell=True,
         )
         logger.info(out)
-        logger.info(f"Wrote postgres backup to {backup_location}")
+        if code == 0 and os.path.exists(backup_location):
+            set_permissions_and_owner(backup_location, mode=0o644)
+            logger.info(f"Wrote postgres backup to {backup_location}")
+            return True
+        logger.error("PostgreSQL backup failed")
+        return False
 
-    def vaultwarden(self):
-        # Backup database
+    def vaultwarden(self) -> bool:
         logger.info("Backing up Vaultwarden")
+        if not shutil.which("docker"):
+            logger.warning("docker command not found, skipping Vaultwarden")
+            return False
+
         logger.info("Generating sqlite backup")
-        out, _ = run_process_with_stdout(
-            ["docker", "exec", "-it", "vaultwarden", "/vaultwarden", "backup"]
+        out, code = run_process_with_stdout(
+            ["docker", "exec", "vaultwarden", "/vaultwarden", "backup"]
         )
         logger.info(out)
+        if code != 0:
+            logger.error("Vaultwarden sqlite backup failed")
+            return False
 
         try:
             logger.info("Creating Vaultwarden sends directory in case it doesn't exist")
-            os.mkdir(f"{VAULTWARDEN_BACKUP_DIR}/sends")
-        except FileExistsError:
-            logger.trace("Sends directory exists!")
+            os.makedirs(f"{VAULTWARDEN_BACKUP_DIR}/sends", exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not create sends directory: {e}")
 
-        # Backup attachments dir
-        # Backup sends dir
-        # Backup config.json
-        # Backup rsa_key*
+        ts = get_datetime_str()
         vaultwarden_backup_file = (
-            f"{self.backup_dir}/vaultwarden/{DATETIME_STR}-vaultwarden.tar.zst"
+            f"{self.backup_dir}/vaultwarden/{ts}-vaultwarden.tar.zst"
         )
 
-        # Determine most recent sqlite backup
         sqlite_backup = get_most_recent_files(
             count=1, path=VAULTWARDEN_BACKUP_DIR, glob_str="*.sqlite3"
         )
+        if not sqlite_backup:
+            logger.error("No Vaultwarden sqlite file found to archive")
+            return False
 
         cmd = [
             "tar",
@@ -149,20 +282,240 @@ class Collect:
             glob.glob("rsa_key*", recursive=True, root_dir=VAULTWARDEN_BACKUP_DIR)
         )
 
-        out, _ = run_process_with_stdout(cmd)
+        out, tar_code = run_process_with_stdout(cmd)
         logger.info(out)
-        os.remove(sqlite_backup[0])
-        logger.info(f"Removed sqlite backup at {sqlite_backup[0]}")
-        logger.info(f"backed up Vaultwarden to {vaultwarden_backup_file}")
+        try:
+            os.remove(sqlite_backup[0])
+            logger.info(f"Removed sqlite backup at {sqlite_backup[0]}")
+        except OSError as e:
+            logger.warning(f"Failed to remove temp sqlite backup: {e}")
 
-    def etc(self):
-        pass
+        if tar_code == 0 and os.path.exists(vaultwarden_backup_file):
+            set_permissions_and_owner(vaultwarden_backup_file, mode=0o644)
+            logger.info(f"Backed up Vaultwarden to {vaultwarden_backup_file}")
+            return True
 
-    def mariadb(self):
-        pass
+        logger.error("Vaultwarden tar archive creation failed")
+        return False
+
+    def etc(self) -> bool:
+        logger.info("Backing up /etc")
+        if not shutil.which("tar"):
+            logger.warning("tar not found, skipping /etc")
+            return False
+
+        ts = get_datetime_str()
+        backup_location = f"{self.backup_dir}/etc/{ts}-etc.tar.zst"
+        cmd = [
+            "tar",
+            "-cv",
+            "--zstd",
+            f"--file={backup_location}",
+            "-C",
+            "/",
+            "etc",
+        ]
+        out, code = run_process_with_stdout(cmd)
+        logger.info(out)
+        # Note: tar exit code 1 indicates some files changed as read, which is
+        # expected on /etc; only code >= 2 is a fatal error.
+        if code in (0, 1) and os.path.exists(backup_location):
+            set_permissions_and_owner(backup_location, mode=0o644)
+            logger.info(f"Backed up /etc to {backup_location}")
+            return True
+
+        logger.error(f"Failed to backup /etc, code {code}")
+        return False
+
+    def mariadb(self) -> bool:
+        logger.info("Backing up MariaDB")
+        dump_tool = None
+        for candidate in ("mariadb-dump", "mysqldump"):
+            if shutil.which(candidate):
+                dump_tool = candidate
+                break
+
+        if not dump_tool:
+            logger.warning("mariadb-dump or mysqldump not found, skipping MariaDB")
+            return False
+
+        ts = get_datetime_str()
+        backup_location = f"{self.backup_dir}/mariadb/{ts}-mariadb.sql.zst"
+        cmd_str = (
+            f"{dump_tool} --all-databases --single-transaction --quick "
+            f"| zstd -o {backup_location}"
+        )
+        out, code = run_process_with_stdout([cmd_str], shell=True)
+        logger.info(out)
+        if code == 0 and os.path.exists(backup_location):
+            set_permissions_and_owner(backup_location, mode=0o644)
+            logger.info(f"Wrote MariaDB backup to {backup_location}")
+            return True
+
+        logger.error("MariaDB backup failed")
+        return False
 
     def amp(self):
-        pass
+        logger.info("Checking AMP instances and backups")
+        self._init_amp_links()
+
+
+class Rotate:
+    backup_dir: str
+    keep: int
+    standard_backup_types: list[str] = [
+        "gitlab",
+        "postgres",
+        "vaultwarden",
+        "etc",
+        "mariadb",
+    ]
+
+    def __init__(self, backup_dir: str, keep: int = DEFAULT_KEEP):
+        self.backup_dir = backup_dir
+        self.keep = keep
+
+    def rotate_all(self) -> dict[str, list[str]]:
+        """
+        Rotate backups across all standard types and AMP instances.
+
+        Returns:
+            Dictionary mapping backup type to list of removed files.
+        """
+        results: dict[str, list[str]] = {}
+        for b_type in self.standard_backup_types:
+            type_dir = os.path.join(self.backup_dir, b_type)
+            if os.path.isdir(type_dir):
+                removed = rotate_directory_backups(type_dir, self.keep)
+                results[b_type] = removed
+
+        # Rotate AMP instances
+        amp_dir = os.path.join(self.backup_dir, "amp")
+        if os.path.isdir(amp_dir):
+            for entry in os.listdir(amp_dir):
+                instance_dir = os.path.join(amp_dir, entry)
+                if os.path.isdir(instance_dir):
+                    removed = rotate_directory_backups(
+                        instance_dir, self.keep, extensions=(".zip",)
+                    )
+                    results[f"amp/{entry}"] = removed
+
+        return results
+
+
+class ExportManager:
+    backup_dir: str
+    export_dir: str
+    export_user: Optional[str]
+    standard_backup_types: list[str] = [
+        "gitlab",
+        "postgres",
+        "vaultwarden",
+        "etc",
+        "mariadb",
+    ]
+
+    def __init__(
+        self,
+        backup_dir: str,
+        export_dir: str,
+        export_user: Optional[str] = DEFAULT_EXPORT_USER,
+    ):
+        self.backup_dir = backup_dir
+        self.export_dir = export_dir
+        self.export_user = export_user
+
+    def sync_all(self) -> None:
+        """
+        Export all active backups into export_dir using hard links.
+        Prunes old/rotated backups from export_dir and ensures proper
+        permissions for the non-root user.
+        """
+        os.makedirs(self.export_dir, exist_ok=True)
+        set_permissions_and_owner(self.export_dir, mode=0o755, user=self.export_user)
+
+        for b_type in self.standard_backup_types:
+            src_type_dir = os.path.join(self.backup_dir, b_type)
+            dst_type_dir = os.path.join(self.export_dir, b_type)
+            if not os.path.isdir(src_type_dir):
+                continue
+
+            os.makedirs(dst_type_dir, exist_ok=True)
+            set_permissions_and_owner(dst_type_dir, mode=0o755, user=self.export_user)
+
+            current_backups = get_backup_files(src_type_dir)
+            active_basenames = set()
+            for src_file in current_backups:
+                basename = os.path.basename(src_file)
+                active_basenames.add(basename)
+                dst_file = os.path.join(dst_type_dir, basename)
+                if link_file_space_efficient(src_file, dst_file):
+                    set_permissions_and_owner(
+                        dst_file, mode=0o644, user=self.export_user
+                    )
+
+            # Prune removed backups from export dir
+            for existing_name in os.listdir(dst_type_dir):
+                if existing_name not in active_basenames:
+                    dst_path = os.path.join(dst_type_dir, existing_name)
+                    try:
+                        os.remove(dst_path)
+                        logger.info(f"Pruned rotated backup from export: {dst_path}")
+                    except OSError as e:
+                        logger.warning(f"Could not prune {dst_path}: {e}")
+
+        # Export AMP instances
+        src_amp_dir = os.path.join(self.backup_dir, "amp")
+        dst_amp_dir = os.path.join(self.export_dir, "amp")
+        if os.path.isdir(src_amp_dir):
+            os.makedirs(dst_amp_dir, exist_ok=True)
+            set_permissions_and_owner(dst_amp_dir, mode=0o755, user=self.export_user)
+
+            active_instances = set()
+            for entry in os.listdir(src_amp_dir):
+                src_inst = os.path.join(src_amp_dir, entry)
+                if not os.path.isdir(src_inst):
+                    continue
+
+                active_instances.add(entry)
+                dst_inst = os.path.join(dst_amp_dir, entry)
+                os.makedirs(dst_inst, exist_ok=True)
+                set_permissions_and_owner(dst_inst, mode=0o755, user=self.export_user)
+
+                current_zips = get_backup_files(src_inst, extensions=(".zip",))
+                active_zips = set()
+                for zip_file in current_zips:
+                    basename = os.path.basename(zip_file)
+                    active_zips.add(basename)
+                    dst_zip = os.path.join(dst_inst, basename)
+                    if link_file_space_efficient(zip_file, dst_zip):
+                        set_permissions_and_owner(
+                            dst_zip, mode=0o644, user=self.export_user
+                        )
+
+                # Prune removed backups for this instance
+                for existing_name in os.listdir(dst_inst):
+                    if existing_name not in active_zips:
+                        dst_path = os.path.join(dst_inst, existing_name)
+                        try:
+                            os.remove(dst_path)
+                            logger.info(
+                                f"Pruned rotated AMP backup from export: {dst_path}"
+                            )
+                        except OSError as e:
+                            logger.warning(f"Could not prune {dst_path}: {e}")
+
+            # Prune obsolete instance dirs in export/amp
+            for existing_inst in os.listdir(dst_amp_dir):
+                if existing_inst not in active_instances:
+                    stale_dir = os.path.join(dst_amp_dir, existing_inst)
+                    try:
+                        shutil.rmtree(stale_dir)
+                        logger.info(
+                            f"Pruned deleted AMP instance directory: {stale_dir}"
+                        )
+                    except OSError as e:
+                        logger.warning(f"Could not prune {stale_dir}: {e}")
 
 
 if __name__ == "__main__":

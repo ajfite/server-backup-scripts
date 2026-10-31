@@ -6,3 +6,6 @@ build/
 *.log
 dummy/
 .DS_Store
+__pycache__/
+*.pyc
+
