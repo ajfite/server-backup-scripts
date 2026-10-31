@@ -1,0 +1,27 @@
+[Unit]
+Description=Server Backup and Rotation Service
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+After=network.target docker.service mariadb.service postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+# Environment & Executable path
+# Adjust PATH or the executable path to match your installation (e.g. system or virtualenv)
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/server-backup-scripts/.venv/bin/backup \
+    --backup-dir /opt/backup-management \
+    --export-dir /home/backup-user/backups \
+    --export-user backup-user \
+    --keep 5
+
+# Basic sandbox and process limits
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target
