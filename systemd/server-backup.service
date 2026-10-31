@@ -8,16 +8,19 @@ Type=oneshot
 User=root
 Group=root
 
-# Environment & Executable path
-# Adjust PATH or the executable path to match your installation (e.g. system or virtualenv)
+# Pipx binary search path (supports both standard 'sudo pipx install' in /root/.local/bin
+# and 'sudo pipx install --global' in /usr/local/bin)
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/home/ubuntu/server-backup-scripts/.venv/bin/backup \
+Environment="PATH=/root/.local/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# ExecStart using /usr/bin/env to locate the pipx-installed entry point in PATH
+ExecStart=/usr/bin/env backup \
     --backup-dir /opt/backup-management \
     --export-dir /home/backup-user/backups \
     --export-user backup-user \
     --keep 5
 
-# Basic sandbox and process limits
+# Process limits & lower I/O priority during runs
 TimeoutStartSec=1800
 Nice=10
 IOSchedulingClass=best-effort
