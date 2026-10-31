@@ -143,6 +143,30 @@ class TestBackupCollect(unittest.TestCase):
 
     @patch("shutil.which")
     @patch("server_backup_scripts.backup_server.run_process_with_stdout")
+    def test_www_collector(self, mock_run, mock_which):
+        mock_which.return_value = "/usr/bin/tar"
+        mock_run.return_value = ("tar output", 0)
+
+        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
+        www_dir = os.path.join(self.backup_dir, "www")
+        with patch("os.path.isdir", side_effect=lambda p: True):
+            with patch(
+                "server_backup_scripts.backup_server.get_datetime_str",
+                return_value="20261031-120000+0000",
+            ):
+                expected_file = os.path.join(
+                    www_dir, "20261031-120000+0000-www.tar.zst"
+                )
+                with open(expected_file, "w") as f:
+                    f.write("tar archive")
+                success = collector.www()
+
+        self.assertTrue(success)
+        self.assertIn("tar", mock_run.call_args[0][0][0])
+        self.assertIn("www", mock_run.call_args[0][0])
+
+    @patch("shutil.which")
+    @patch("server_backup_scripts.backup_server.run_process_with_stdout")
     def test_postgres_collector(self, mock_run, mock_which):
         mock_which.return_value = "/usr/bin/pg_dumpall"
         mock_run.return_value = ("pg output", 0)

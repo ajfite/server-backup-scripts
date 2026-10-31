@@ -25,6 +25,18 @@ DEFAULT_KEEP: int = 5
 GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
 VAULTWARDEN_BACKUP_DIR: str = "/opt/docker/vaultwarden/vw-data"
 
+STANDARD_BACKUP_TYPES: list[str] = [
+    "gitlab",
+    "postgres",
+    "vaultwarden",
+    "etc",
+    "www",
+    "mariadb",
+]
+SPECIAL_BACKUP_TYPES: list[str] = [
+    "amp",
+]
+
 
 def get_datetime_str() -> str:
     """Return formatted UTC datetime string."""
@@ -93,6 +105,7 @@ def main(
         collector.postgres()
         collector.vaultwarden()
         collector.etc()
+        collector.www()
         collector.mariadb()
         collector.amp()
 
@@ -110,16 +123,8 @@ def main(
 class Collect:
     backup_dir: str
     amp_dir: str
-    standard_backup_types: list[str] = [
-        "gitlab",
-        "postgres",
-        "vaultwarden",
-        "etc",
-        "mariadb",
-    ]
-    special_backup_types: list[str] = [
-        "amp",
-    ]
+    standard_backup_types: list[str] = STANDARD_BACKUP_TYPES
+    special_backup_types: list[str] = SPECIAL_BACKUP_TYPES
 
     def __init__(
         self,
@@ -298,34 +303,58 @@ class Collect:
         logger.error("Vaultwarden tar archive creation failed")
         return False
 
-    def etc(self) -> bool:
-        logger.info("Backing up /etc")
+    def archive_directory(
+        self, target_dir: str, backup_type: Optional[str] = None
+    ) -> bool:
+        """
+        Archive a directory using tar and zstd compression.
+        """
+        b_type = (
+            backup_type
+            if backup_type is not None
+            else os.path.basename(target_dir.rstrip("/"))
+        )
+        logger.info(f"Backing up {target_dir} ({b_type})")
+
         if not shutil.which("tar"):
-            logger.warning("tar not found, skipping /etc")
+            logger.warning(f"tar not found, skipping {b_type}")
+            return False
+
+        if not os.path.isdir(target_dir):
+            logger.warning(f"Directory {target_dir} does not exist, skipping {b_type}")
             return False
 
         ts = get_datetime_str()
-        backup_location = f"{self.backup_dir}/etc/{ts}-etc.tar.zst"
+        backup_location = f"{self.backup_dir}/{b_type}/{ts}-{b_type}.tar.zst"
+        parent_dir = os.path.dirname(os.path.abspath(target_dir))
+        dir_name = os.path.basename(os.path.abspath(target_dir))
+
         cmd = [
             "tar",
             "-cv",
             "--zstd",
             f"--file={backup_location}",
             "-C",
-            "/",
-            "etc",
+            parent_dir,
+            dir_name,
         ]
         out, code = run_process_with_stdout(cmd)
         logger.info(out)
-        # Note: tar exit code 1 indicates some files changed as read, which is
-        # expected on /etc; only code >= 2 is a fatal error.
+        # tar exit code 1 indicates some files changed as read, which is
+        # normal on live server directories. Code >= 2 is a fatal error.
         if code in (0, 1) and os.path.exists(backup_location):
             set_permissions_and_owner(backup_location, mode=0o644)
-            logger.info(f"Backed up /etc to {backup_location}")
+            logger.info(f"Backed up {target_dir} to {backup_location}")
             return True
 
-        logger.error(f"Failed to backup /etc, code {code}")
+        logger.error(f"Failed to backup {target_dir}, code {code}")
         return False
+
+    def etc(self) -> bool:
+        return self.archive_directory("/etc", "etc")
+
+    def www(self) -> bool:
+        return self.archive_directory("/www", "www")
 
     def mariadb(self) -> bool:
         logger.info("Backing up MariaDB")
@@ -363,13 +392,7 @@ class Collect:
 class Rotate:
     backup_dir: str
     keep: int
-    standard_backup_types: list[str] = [
-        "gitlab",
-        "postgres",
-        "vaultwarden",
-        "etc",
-        "mariadb",
-    ]
+    standard_backup_types: list[str] = STANDARD_BACKUP_TYPES
 
     def __init__(self, backup_dir: str, keep: int = DEFAULT_KEEP):
         self.backup_dir = backup_dir
@@ -407,13 +430,7 @@ class ExportManager:
     backup_dir: str
     export_dir: str
     export_user: Optional[str]
-    standard_backup_types: list[str] = [
-        "gitlab",
-        "postgres",
-        "vaultwarden",
-        "etc",
-        "mariadb",
-    ]
+    standard_backup_types: list[str] = STANDARD_BACKUP_TYPES
 
     def __init__(
         self,
