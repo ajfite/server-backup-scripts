@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import glob
 import os
+import shlex
 import shutil
 import time
 from typing import Optional
@@ -228,7 +229,7 @@ class Collect:
         ts = get_datetime_str()
         backup_location = f"{self.backup_dir}/postgres/{ts}-postgres.sql.zst"
         out, code = run_process_with_stdout(
-            [f"sudo -u postgres pg_dumpall | zstd -o {backup_location}"],
+            [f"sudo -u postgres pg_dumpall | zstd -19 -T0 -o {backup_location}"],
             shell=True,
         )
         logger.info(out)
@@ -272,22 +273,21 @@ class Collect:
             logger.error("No Vaultwarden sqlite file found to archive")
             return False
 
-        cmd = [
+        tar_args = [
             "tar",
             "-cv",
-            "--zstd",
-            f"--file={vaultwarden_backup_file}",
             f"--directory={VAULTWARDEN_BACKUP_DIR}",
             "attachments",
             "config.json",
             "sends",
             sqlite_backup[0],
         ]
-        cmd.extend(
+        tar_args.extend(
             glob.glob("rsa_key*", recursive=True, root_dir=VAULTWARDEN_BACKUP_DIR)
         )
+        cmd_str = f"{shlex.join(tar_args)} | zstd -19 -T0 -o {vaultwarden_backup_file}"
 
-        out, tar_code = run_process_with_stdout(cmd)
+        out, tar_code = run_process_with_stdout([cmd_str], shell=True)
         logger.info(out)
         try:
             os.remove(sqlite_backup[0])
@@ -330,15 +330,9 @@ class Collect:
         dir_name = os.path.basename(os.path.abspath(target_dir))
 
         cmd = [
-            "tar",
-            "-cv",
-            "--zstd",
-            f"--file={backup_location}",
-            "-C",
-            parent_dir,
-            dir_name,
+            f"tar -cv -C {parent_dir} {dir_name} | zstd -19 -T0 -o {backup_location}"
         ]
-        out, code = run_process_with_stdout(cmd)
+        out, code = run_process_with_stdout(cmd, shell=True)
         logger.info(out)
         # tar exit code 1 indicates some files changed as read, which is
         # normal on live server directories. Code >= 2 is a fatal error.
@@ -372,7 +366,7 @@ class Collect:
         backup_location = f"{self.backup_dir}/mariadb/{ts}-mariadb.sql.zst"
         cmd_str = (
             f"{dump_tool} --all-databases --single-transaction --quick "
-            f"| zstd -o {backup_location}"
+            f"| zstd -19 -T0 -o {backup_location}"
         )
         out, code = run_process_with_stdout([cmd_str], shell=True)
         logger.info(out)

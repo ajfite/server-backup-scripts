@@ -162,8 +162,10 @@ class TestBackupCollect(unittest.TestCase):
                 success = collector.www()
 
         self.assertTrue(success)
-        self.assertIn("tar", mock_run.call_args[0][0][0])
-        self.assertIn("www", mock_run.call_args[0][0])
+        cmd_str = mock_run.call_args[0][0][0]
+        self.assertIn("tar", cmd_str)
+        self.assertIn("www", cmd_str)
+        self.assertIn("zstd -19 -T0", cmd_str)
 
     @patch("shutil.which")
     @patch("server_backup_scripts.backup_server.run_process_with_stdout")
