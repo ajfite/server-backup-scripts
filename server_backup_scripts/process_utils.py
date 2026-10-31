@@ -18,7 +18,6 @@ def run_process_with_stdout(cmd: list[str], shell: bool = False) -> tuple[str, i
         shell=shell,
     )
     out, error = process.communicate()
-    process.wait()
 
     if len(error) > 0:
         logger.error(error)

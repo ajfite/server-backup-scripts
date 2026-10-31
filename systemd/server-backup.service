@@ -21,7 +21,7 @@ ExecStart=/usr/bin/env backup \
     --keep 5
 
 # Process limits & lower I/O priority during runs
-TimeoutStartSec=1800
+TimeoutStartSec=14400
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6

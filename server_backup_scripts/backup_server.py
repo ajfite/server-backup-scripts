@@ -4,7 +4,7 @@ import os
 import shlex
 import shutil
 import time
-from typing import Optional
+from typing import ClassVar, Optional
 
 import click
 from loguru import logger
@@ -43,8 +43,6 @@ def get_datetime_str() -> str:
     """Return formatted UTC datetime string."""
     return time.strftime("%Y%m%d-%H%M%S%z", time.gmtime())
 
-
-DATETIME_STR: str = get_datetime_str()
 
 
 @click.command()
@@ -97,7 +95,7 @@ def main(
     amp_dir: str,
     skip_collect: bool,
 ):
-    logger.add(f"{backup_dir}/backup_service.log", rotation="100 KB")
+    logger.add(f"{backup_dir}/backup_service.log", rotation="100 KB", retention=10)
     logger.info(f"Managing backups at: {backup_dir}")
 
     collector = Collect(backup_dir=backup_dir, amp_dir=amp_dir)
@@ -124,8 +122,8 @@ def main(
 class Collect:
     backup_dir: str
     amp_dir: str
-    standard_backup_types: list[str] = STANDARD_BACKUP_TYPES
-    special_backup_types: list[str] = SPECIAL_BACKUP_TYPES
+    standard_backup_types: ClassVar[list[str]] = STANDARD_BACKUP_TYPES
+    special_backup_types: ClassVar[list[str]] = SPECIAL_BACKUP_TYPES
 
     def __init__(
         self,
@@ -184,7 +182,7 @@ class Collect:
 
             if os.path.exists(path):
                 if os.path.isdir(path):
-                    logger.info(f"Directory for {backup_type} already exists :)")
+                    logger.debug(f"Directory for {backup_type} already exists")
                 else:
                     logger.critical(f"{path} exists but it is not a directory")
                     logger.critical(
@@ -203,21 +201,26 @@ class Collect:
             logger.warning("gitlab-backup command not found, skipping Gitlab")
             return False
 
+        existing_backups = set(get_most_recent_files(GITLAB_BACKUP_DIR, count=100))
+
         log, code = run_process_with_stdout(["gitlab-backup", "create"])
         logger.info(log)
         if code != 0:
             logger.error("Gitlab backup creation failed")
             return False
 
-        backups = get_most_recent_files(GITLAB_BACKUP_DIR, 1)
-        if not backups:
-            logger.error(f"No Gitlab backup files found in {GITLAB_BACKUP_DIR}")
+        all_backups = get_most_recent_files(GITLAB_BACKUP_DIR, 1)
+        new_backups = [f for f in all_backups if f not in existing_backups]
+        if not new_backups:
+            logger.error(
+                f"gitlab-backup exited 0 but no new backup file found in {GITLAB_BACKUP_DIR}"
+            )
             return False
 
         dest = os.path.join(self.backup_dir, "gitlab")
-        copied_file = shutil.copy(backups[0], dest)
+        copied_file = shutil.copy(new_backups[0], dest)
         set_permissions_and_owner(copied_file, mode=0o644)
-        logger.info(f"Copied Gitlab backup {backups[0]} to {dest}")
+        logger.info(f"Copied Gitlab backup {new_backups[0]} to {dest}")
         return True
 
     def postgres(self) -> bool:
@@ -229,7 +232,10 @@ class Collect:
         ts = get_datetime_str()
         backup_location = f"{self.backup_dir}/postgres/{ts}-postgres.sql.zst"
         out, code = run_process_with_stdout(
-            [f"sudo -u postgres pg_dumpall | zstd -19 -T0 -o {backup_location}"],
+            [
+                f"set -o pipefail; sudo -u postgres pg_dumpall"
+                f" | zstd -19 -T0 -o {shlex.quote(backup_location)}"
+            ],
             shell=True,
         )
         logger.info(out)
@@ -285,17 +291,20 @@ class Collect:
         tar_args.extend(
             glob.glob("rsa_key*", recursive=True, root_dir=VAULTWARDEN_BACKUP_DIR)
         )
-        cmd_str = f"{shlex.join(tar_args)} | zstd -19 -T0 -o {vaultwarden_backup_file}"
+        cmd_str = (
+            f"{shlex.join(tar_args)}"
+            f" | zstd -19 -T0 -o {shlex.quote(vaultwarden_backup_file)}"
+        )
 
         out, tar_code = run_process_with_stdout([cmd_str], shell=True)
         logger.info(out)
-        try:
-            os.remove(sqlite_backup[0])
-            logger.info(f"Removed sqlite backup at {sqlite_backup[0]}")
-        except OSError as e:
-            logger.warning(f"Failed to remove temp sqlite backup: {e}")
 
         if tar_code == 0 and os.path.exists(vaultwarden_backup_file):
+            try:
+                os.remove(sqlite_backup[0])
+                logger.info(f"Removed sqlite backup at {sqlite_backup[0]}")
+            except OSError as e:
+                logger.warning(f"Failed to remove temp sqlite backup: {e}")
             set_permissions_and_owner(vaultwarden_backup_file, mode=0o644)
             logger.info(f"Backed up Vaultwarden to {vaultwarden_backup_file}")
             return True
@@ -330,7 +339,9 @@ class Collect:
         dir_name = os.path.basename(os.path.abspath(target_dir))
 
         cmd = [
-            f"tar -cv -C {parent_dir} {dir_name} | zstd -19 -T0 -o {backup_location}"
+            f"set -o pipefail;"
+            f" tar -cv -C {shlex.quote(parent_dir)} {shlex.quote(dir_name)}"
+            f" | zstd -19 -T0 -o {shlex.quote(backup_location)}"
         ]
         out, code = run_process_with_stdout(cmd, shell=True)
         logger.info(out)
@@ -365,8 +376,9 @@ class Collect:
         ts = get_datetime_str()
         backup_location = f"{self.backup_dir}/mariadb/{ts}-mariadb.sql.zst"
         cmd_str = (
-            f"{dump_tool} --all-databases --single-transaction --quick "
-            f"| zstd -19 -T0 -o {backup_location}"
+            f"set -o pipefail;"
+            f" {shlex.quote(dump_tool)} --all-databases --single-transaction --quick"
+            f" | zstd -19 -T0 -o {shlex.quote(backup_location)}"
         )
         out, code = run_process_with_stdout([cmd_str], shell=True)
         logger.info(out)
@@ -378,9 +390,8 @@ class Collect:
         logger.error("MariaDB backup failed")
         return False
 
-    def amp(self):
-        logger.info("Checking AMP instances and backups")
-        self._init_amp_links()
+    def amp(self) -> None:
+        logger.info("Checked AMP instances and backup links (initialized at startup)")
 
 
 class Rotate:
