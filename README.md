@@ -35,4 +35,9 @@ sudo systemctl enable --now server-backup.timer server-update.timer
   Alerts go through the local Postfix, so a server that is down, or a timer that
   stops firing, sends nothing.
 
+- `mastodon/clean-mastodon.sh` runs nightly from `mastodon-clean.timer`, as the
+  `mastodon` user, and alerts by email if a step fails or it runs out of time. It is
+  not installed by the steps above: copy it to `/home/mastodon/`, copy the
+  `systemd/mastodon-clean.*` units, and enable the timer.
+
 Do not run the tests as root on a production host.

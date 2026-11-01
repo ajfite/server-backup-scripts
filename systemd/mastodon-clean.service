@@ -1,0 +1,24 @@
+[Unit]
+Description=Mastodon Remote Content Cleanup
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+OnFailure=server-alert@%n.service
+After=network.target docker.service postgresql.service
+
+[Service]
+Type=oneshot
+User=mastodon
+Group=mastodon
+WorkingDirectory=/home/mastodon/live
+
+Environment="PATH=/home/mastodon/.rbenv/shims:/usr/local/bin:/usr/bin:/bin"
+Environment="MALLOC_ARENA_MAX=2"
+
+ExecStart=/home/mastodon/clean-mastodon.sh
+
+# Stop before the 04:00 backup. Progress is kept, so the next run continues from here.
+TimeoutStartSec=5h30min
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# No [Install] section: this only runs from mastodon-clean.timer, not at boot

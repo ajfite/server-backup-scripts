@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Mastodon Remote Content Cleanup Timer
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+
+[Timer]
+# Nightly at 10:00 PM Pacific Time, so it is done before the 4:00 AM backup
+OnCalendar=*-*-* 22:00:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target
