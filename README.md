@@ -2,6 +2,8 @@
 
 A python script set for managing backups on my server.
 
+The repo is ~80% vibe coded, I wouldn't recommend running it directly on your server without an audit, its intended for me.
+
 ## Deploying
 
 Install or upgrade the `backup` and `update` commands as root, install the units,
