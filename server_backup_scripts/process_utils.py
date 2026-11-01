@@ -1,7 +1,7 @@
 import os
 import subprocess
 import tempfile
-from typing import IO, Sequence
+from typing import IO, Mapping, Optional, Sequence
 
 from loguru import logger
 
@@ -21,7 +21,9 @@ def _log_stderr(label: str, stderr: str, succeeded: bool) -> None:
         logger.error(f"{label} stderr: {text}")
 
 
-def run_process_with_stdout(cmd: list[str]) -> tuple[str, int]:
+def run_process_with_stdout(
+    cmd: list[str], env: Optional[Mapping[str, str]] = None
+) -> tuple[str, int]:
     logger.info(f"Running {cmd}")
 
     try:
@@ -31,6 +33,7 @@ def run_process_with_stdout(cmd: list[str]) -> tuple[str, int]:
             stderr=subprocess.PIPE,
             text=True,
             errors="replace",
+            env={**os.environ, **env} if env else None,
         )
     except OSError as e:
         logger.error(f"Could not start {cmd}: {e}")

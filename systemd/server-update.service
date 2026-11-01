@@ -1,0 +1,21 @@
+[Unit]
+Description=Server Package and Container Image Update Service
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+# Also keeps this from overlapping a backup that is still running
+After=network-online.target docker.service server-backup.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=/root/.local/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ExecStart=/usr/bin/env update
+
+# A GitLab package upgrade alone can take a while
+TimeoutStartSec=7200
+
+# No [Install] section: this only runs from server-update.timer, not at boot

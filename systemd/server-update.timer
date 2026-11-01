@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly Server Update Timer
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+
+[Timer]
+# Tuesdays at 9:00 AM Pacific Time, after that morning's backup has finished
+OnCalendar=Tue *-*-* 09:00:00 America/Los_Angeles
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
