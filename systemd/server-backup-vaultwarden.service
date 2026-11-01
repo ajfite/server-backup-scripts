@@ -19,7 +19,8 @@ ExecStart=/usr/bin/env backup \
     --backup-dir /opt/backup-management \
     --export-dir /home/backup-user/backups \
     --export-user backup-user \
-    --only vaultwarden
+    --only vaultwarden \
+    --only amp
 
 # Process limits & lower I/O priority during runs
 TimeoutStartSec=3600

@@ -23,8 +23,7 @@ ExecStart=/usr/bin/env backup \
     --export-user backup-user \
     --only etc \
     --only www \
-    --only gitlab \
-    --only amp
+    --only gitlab
 
 # Process limits & lower I/O priority during runs
 TimeoutStartSec=14400

@@ -29,7 +29,7 @@ sudo systemctl enable --now server-backup-vaultwarden.timer server-backup-databa
   | `server-backup-databases` | Postgres, MariaDB | Monday and Thursday, 4:00 AM | 5 |
   | `server-backup-weekly` | `/etc`, `/www` | Sunday, 4:00 AM | 4 |
   | `server-backup-weekly` | GitLab | Sunday, 4:00 AM | 5 |
-  | `server-backup-weekly` | AMP (export only) | Sunday, 4:00 AM | AMP decides |
+  | `server-backup-vaultwarden` | AMP (export only) | Daily, 3:30 AM | AMP decides |
 - A backup type that failed is not rotated that run.
 - `/opt/backup-management` is private to root. `backup-user` reads backups through
   the root-owned export directory.
