@@ -9,6 +9,7 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from server_backup_scripts.backup_server import (
+    KEEP_BY_TYPE,
     STANDARD_BACKUP_TYPES,
     Collect,
     CollectResult,
@@ -433,8 +434,36 @@ class TestRotation(TempDirTestCase):
             os.listdir(self.pg_dir), ["file_3.sql.zst", "file_2.sql.zst"]
         )
 
+    def test_unselected_type_keeps_everything(self):
+        Rotate(backup_dir=self.backup_dir, keep=2).rotate_all(["etc"])
+        self.assertEqual(len(os.listdir(self.pg_dir)), 4)
+
+    def test_keep_comes_from_type_unless_overridden(self):
+        self.assertEqual(
+            KEEP_BY_TYPE,
+            {
+                "vaultwarden": 30,
+                "postgres": 5,
+                "mariadb": 5,
+                "etc": 4,
+                "www": 4,
+                "gitlab": 5,
+            },
+        )
+        for b_type, count in (("vaultwarden", 32), ("etc", 6), ("gitlab", 7)):
+            for i in range(count):
+                write_file(
+                    os.path.join(self.backup_dir, b_type, f"{i}.tar.zst"),
+                    mtime=OLD_TIME + i,
+                )
+        Rotate(backup_dir=self.backup_dir).rotate_all()
+        for b_type, kept in (("vaultwarden", 30), ("etc", 4), ("gitlab", 5)):
+            remaining = os.listdir(os.path.join(self.backup_dir, b_type))
+            self.assertEqual(len(remaining), kept, b_type)
+        self.assertNotIn("0.tar.zst", os.listdir(os.path.join(self.backup_dir, "etc")))
+
     def test_skipped_type_keeps_everything(self):
-        Rotate(backup_dir=self.backup_dir, keep=2).rotate_all(["postgres"])
+        Rotate(backup_dir=self.backup_dir, keep=2).rotate_all(skip_types=["postgres"])
         self.assertEqual(len(os.listdir(self.pg_dir)), 4)
 
 
@@ -471,6 +500,20 @@ class TestExportManager(TempDirTestCase):
         self.assertEqual(self.exporter.sync_all(), [])
         self.assertFalse(os.path.exists(exp_b1))
         self.assertTrue(os.path.exists(exp_b2))
+
+    def test_only_selected_types_are_exported(self):
+        pg = write_file(os.path.join(self.backup_dir, "postgres", "p.sql.zst"))
+        self.amp_backup("Inst")
+        self.assertEqual(self.exporter.sync_all(["postgres"]), [])
+        self.assertTrue(os.path.exists(os.path.join(self.export_dir, "postgres")))
+        self.assertTrue(os.path.exists(pg))
+        for skipped in ("vaultwarden", "amp"):
+            self.assertFalse(os.path.exists(os.path.join(self.export_dir, skipped)))
+
+    def test_amp_can_be_selected_alone(self):
+        self.amp_backup("Inst")
+        self.assertEqual(self.exporter.sync_all(["amp"]), [])
+        self.assertEqual(os.listdir(self.export_dir), ["amp"])
 
     def test_empty_source_does_not_wipe_export(self):
         self.exporter.sync_all()
@@ -705,6 +748,46 @@ class TestCliIntegration(TempDirTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.backup_dir, "amp")))
         for path in zips:
             self.assertTrue(os.path.exists(path))
+
+    def test_only_limits_collectors_rotation_and_export(self):
+        self.etc_backups(6)
+        write_file(os.path.join(self.backup_dir, "www", "w.tar.zst"))
+        for i in range(8):
+            write_file(
+                os.path.join(self.backup_dir, "postgres", f"{i}.sql.zst"),
+                mtime=OLD_TIME + i,
+            )
+        ran = []
+
+        def collector(name):
+            def run(_self):
+                ran.append(name)
+                return CollectResult.OK
+
+            return run
+
+        with (
+            patch.object(Collect, "etc", collector("etc")),
+            patch.object(Collect, "www", collector("www")),
+            patch.object(Collect, "postgres", collector("postgres")),
+            patch.object(Collect, "mariadb", collector("mariadb")),
+            patch.object(Collect, "gitlab", collector("gitlab")),
+            patch.object(Collect, "vaultwarden", collector("vaultwarden")),
+        ):
+            result = self.run_cli("--only", "etc", "--only", "www")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(ran, ["etc", "www"])
+        self.assertEqual(len(os.listdir(os.path.join(self.backup_dir, "etc"))), 4)
+        self.assertEqual(len(os.listdir(os.path.join(self.backup_dir, "postgres"))), 8)
+        self.assertCountEqual(os.listdir(self.export_dir), ["etc", "www"])
+
+    def test_only_rejects_unknown_type(self):
+        self.assertEqual(self.run_cli("--only", "nope").exit_code, 2)
+
+    def test_only_amp_runs_no_collectors(self):
+        with patch.object(Collect, "gitlab", side_effect=AssertionError("ran")):
+            result = self.run_cli("--only", "amp")
+        self.assertEqual(result.exit_code, 0)
 
     def test_keep_zero_is_rejected(self):
         self.etc_backups()

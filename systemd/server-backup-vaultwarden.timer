@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Vaultwarden Backup Timer
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+
+[Timer]
+# Daily at 3:30 AM Pacific Time, ahead of the larger backups. Started exactly on time
+# because server-update.timer is set to follow it.
+OnCalendar=*-*-* 03:30:00 America/Los_Angeles
+AccuracySec=1s
+# Catch up if the server was powered off during the scheduled time
+Persistent=true
+
+[Install]
+WantedBy=timers.target

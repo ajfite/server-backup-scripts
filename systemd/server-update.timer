@@ -3,9 +3,11 @@ Description=Weekly Server Update Timer
 Documentation=https://git.nclf.net/ajfite/server-backup-scripts
 
 [Timer]
-# Tuesdays at 9:00 AM Pacific Time, after that morning's backup has finished
-OnCalendar=Tue *-*-* 09:00:00 America/Los_Angeles
-RandomizedDelaySec=15m
+# Tuesdays at 3:31 AM Pacific Time, right after the Vaultwarden backup. It is the only
+# backup that day, which leaves the rest of the day for the TrueNAS rsync.
+# server-update.service waits if that backup is still running.
+OnCalendar=Tue *-*-* 03:31:00 America/Los_Angeles
+AccuracySec=1s
 Persistent=true
 
 [Install]

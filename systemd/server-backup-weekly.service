@@ -1,8 +1,10 @@
 [Unit]
-Description=Server Backup and Rotation Service
+Description=Weekly Backup and Rotation Service
 Documentation=https://git.nclf.net/ajfite/server-backup-scripts
 OnFailure=server-alert@%n.service
 After=network.target docker.service mariadb.service postgresql.service
+# Runs one at a time if they are ever due together
+After=server-backup-vaultwarden.service server-backup-databases.service
 
 [Service]
 Type=oneshot
@@ -19,7 +21,10 @@ ExecStart=/usr/bin/env backup \
     --backup-dir /opt/backup-management \
     --export-dir /home/backup-user/backups \
     --export-user backup-user \
-    --keep 5
+    --only etc \
+    --only www \
+    --only gitlab \
+    --only amp
 
 # Process limits & lower I/O priority during runs
 TimeoutStartSec=14400
@@ -27,4 +32,4 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 
-# No [Install] section: this only runs from server-backup.timer, not at boot
+# No [Install] section: this only runs from server-backup-weekly.timer, not at boot

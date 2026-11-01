@@ -1,10 +1,10 @@
 [Unit]
-Description=Daily Server Backup Timer
+Description=Twice Weekly Database Backup Timer
 Documentation=https://git.nclf.net/ajfite/server-backup-scripts
 
 [Timer]
-# Run daily at ~4:00 AM Pacific Time (Washington State)
-OnCalendar=*-*-* 04:00:00 America/Los_Angeles
+# Mondays and Thursdays at ~4:00 AM Pacific Time, after the Mastodon cleanup
+OnCalendar=Mon,Thu *-*-* 04:00:00 America/Los_Angeles
 RandomizedDelaySec=15m
 # Catch up if the server was powered off during the scheduled time
 Persistent=true

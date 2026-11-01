@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly Backup Timer
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+
+[Timer]
+# Sundays at ~4:00 AM Pacific Time
+OnCalendar=Sun *-*-* 04:00:00 America/Los_Angeles
+RandomizedDelaySec=15m
+# Catch up if the server was powered off during the scheduled time
+Persistent=true
+
+[Install]
+WantedBy=timers.target

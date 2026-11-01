@@ -27,7 +27,6 @@ DEFAULT_BACKUP_DIR: str = "/opt/backup-management"
 DEFAULT_EXPORT_DIR: str = "/home/backup-user/backups"
 DEFAULT_EXPORT_USER: str = "backup-user"
 DEFAULT_AMP_DIR: str = "/home/amp/.ampdata/instances"
-DEFAULT_KEEP: int = 5
 GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
 GITLAB_BACKUP_COMMAND: str = "/opt/gitlab/bin/gitlab-backup"
 VAULTWARDEN_BACKUP_DIR: str = "/opt/docker/vaultwarden/vw-data"
@@ -46,6 +45,17 @@ STANDARD_BACKUP_TYPES: list[str] = [
     "www",
     "mariadb",
 ]
+# AMP has no collector or rotation: it makes and prunes its own backups, which are
+# only exported. It can be selected with --only for that export.
+SELECTABLE_BACKUP_TYPES: list[str] = [*STANDARD_BACKUP_TYPES, "amp"]
+KEEP_BY_TYPE: dict[str, int] = {
+    "gitlab": 5,
+    "postgres": 5,
+    "vaultwarden": 30,
+    "etc": 4,
+    "www": 4,
+    "mariadb": 5,
+}
 
 
 class CollectResult(enum.Enum):
@@ -85,8 +95,14 @@ def get_datetime_str() -> str:
     "-k",
     "--keep",
     type=click.IntRange(min=1),
-    default=DEFAULT_KEEP,
-    help="Number of backups to keep per type during rotation",
+    default=None,
+    help="Override the number of backups to keep for every type during rotation",
+)
+@click.option(
+    "--only",
+    type=click.Choice(SELECTABLE_BACKUP_TYPES),
+    multiple=True,
+    help="Back up, rotate and export only this type. Can be repeated. Default: all",
 )
 @click.option(
     "--amp-dir",
@@ -105,7 +121,8 @@ def main(
     backup_dir: str,
     export_dir: str,
     export_user: str,
-    keep: int,
+    keep: Optional[int],
+    only: tuple[str, ...],
     amp_dir: str,
     skip_collect: bool,
 ):
@@ -113,15 +130,17 @@ def main(
     logger.add(f"{backup_dir}/backup_service.log", rotation="1 MB", retention=30)
     logger.info(f"Managing backups at: {backup_dir}")
 
+    types = list(only) or SELECTABLE_BACKUP_TYPES
+
     failures: list[str] = []
     failed_types: list[str] = []
     if not skip_collect:
-        failed_types = Collect(backup_dir=backup_dir).collect_all()
+        failed_types = Collect(backup_dir=backup_dir).collect_all(types)
         failures.extend(failed_types)
 
     # A type that failed keeps all its backups until it next succeeds.
     rotator = Rotate(backup_dir=backup_dir, keep=keep)
-    if not _run_step("rotation", lambda: rotator.rotate_all(failed_types)):
+    if not _run_step("rotation", lambda: rotator.rotate_all(types, failed_types)):
         failures.append("rotation")
 
     exporter = ExportManager(
@@ -130,7 +149,7 @@ def main(
         export_user=export_user,
         amp_dir=amp_dir,
     )
-    if not _run_step("export", lambda: failures.extend(exporter.sync_all())):
+    if not _run_step("export", lambda: failures.extend(exporter.sync_all(types))):
         failures.append("export")
 
     if failures:
@@ -178,9 +197,12 @@ class Collect:
         except OSError as e:
             logger.warning(f"Could not remove {amp_links_dir}: {e}")
 
-    def collect_all(self) -> list[str]:
+    def collect_all(self, types: Collection[str] = STANDARD_BACKUP_TYPES) -> list[str]:
         """
-        Run every collector, so one failing cannot stop the others.
+        Run the selected collectors, so one failing cannot stop the others.
+
+        Args:
+            types: Backup types to collect.
 
         Returns:
             Backup types that failed.
@@ -189,6 +211,8 @@ class Collect:
 
         failed = []
         for backup_type in STANDARD_BACKUP_TYPES:
+            if backup_type not in types:
+                continue
             collector: Callable[[], CollectResult] = getattr(self, backup_type)
             try:
                 result = collector()
@@ -387,31 +411,40 @@ class Collect:
 
 class Rotate:
     backup_dir: str
-    keep: int
+    keep: Optional[int]
 
-    def __init__(self, backup_dir: str, keep: int = DEFAULT_KEEP):
+    def __init__(self, backup_dir: str, keep: Optional[int] = None):
         self.backup_dir = backup_dir
         self.keep = keep
 
-    def rotate_all(self, skip_types: Collection[str] = ()) -> dict[str, list[str]]:
+    def rotate_all(
+        self,
+        types: Collection[str] = STANDARD_BACKUP_TYPES,
+        skip_types: Collection[str] = (),
+    ) -> dict[str, list[str]]:
         """
-        Rotate backups across all standard types. AMP manages its own retention
-        and holds the only copy of its backups, so it is deliberately left out.
+        Rotate backups of the selected types, keeping KEEP_BY_TYPE of each unless
+        overridden. AMP manages its own retention and holds the only copy of its
+        backups, so it is deliberately left out.
 
         Args:
-            skip_types: Backup types to leave untouched.
+            types: Backup types to rotate.
+            skip_types: Backup types to leave untouched because they failed.
 
         Returns:
             Dictionary mapping backup type to list of removed files.
         """
         results: dict[str, list[str]] = {}
         for b_type in STANDARD_BACKUP_TYPES:
+            if b_type not in types:
+                continue
             if b_type in skip_types:
                 logger.warning(f"Not rotating {b_type} because its backup failed")
                 continue
             type_dir = os.path.join(self.backup_dir, b_type)
             if os.path.isdir(type_dir):
-                results[b_type] = rotate_directory_backups(type_dir, self.keep)
+                keep = self.keep if self.keep is not None else KEEP_BY_TYPE[b_type]
+                results[b_type] = rotate_directory_backups(type_dir, keep)
 
         return results
 
@@ -445,12 +478,15 @@ class ExportManager:
             self._export_uid = pw.pw_uid
             self._export_gid = pw.pw_gid
 
-    def sync_all(self) -> list[str]:
+    def sync_all(self, types: Collection[str] = SELECTABLE_BACKUP_TYPES) -> list[str]:
         """
-        Export all active backups into export_dir using hard links, pruning
-        rotated ones. The export is owned by root and readable by the export
-        user's group, so that user can neither alter the backups nor have root
-        act on symlinks it planted.
+        Export active backups of the selected types into export_dir using hard
+        links, pruning rotated ones. The export is owned by root and readable by
+        the export user's group, so that user can neither alter the backups nor
+        have root act on symlinks it planted.
+
+        Args:
+            types: Backup types to export.
 
         Returns:
             Export areas that had failures.
@@ -465,9 +501,9 @@ class ExportManager:
         try:
             failures = []
             for b_type in STANDARD_BACKUP_TYPES:
-                if not self._sync_type(b_type, export_fd):
+                if b_type in types and not self._sync_type(b_type, export_fd):
                     failures.append(f"export:{b_type}")
-            if not self._sync_amp(export_fd):
+            if "amp" in types and not self._sync_amp(export_fd):
                 failures.append("export:amp")
             return failures
         finally:
