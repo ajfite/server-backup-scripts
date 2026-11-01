@@ -1,6 +1,7 @@
 [Unit]
 Description=Server Package and Container Image Update Service
 Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+OnFailure=server-alert@%n.service
 # Also keeps this from overlapping a backup that is still running
 After=network-online.target docker.service server-backup.service
 Wants=network-online.target

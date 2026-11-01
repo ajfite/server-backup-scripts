@@ -43,6 +43,7 @@ deploy = [
 [project.scripts]
 backup = "server_backup_scripts.backup_server:main"
 update = "server_backup_scripts.update_server:main"
+alert = "server_backup_scripts.email_alert:main"
 
 [project.urls]
 Repository = "https://git.nclf.net/ajfite/server-backup-scripts.git"

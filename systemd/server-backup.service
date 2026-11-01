@@ -1,6 +1,7 @@
 [Unit]
 Description=Server Backup and Rotation Service
 Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+OnFailure=server-alert@%n.service
 After=network.target docker.service mariadb.service postgresql.service
 
 [Service]

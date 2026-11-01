@@ -1,0 +1,16 @@
+[Unit]
+Description=Failure Alert Email for %i
+Documentation=https://git.nclf.net/ajfite/server-backup-scripts
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=/root/.local/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# systemd sets MONITOR_* for this from the unit that failed
+ExecStart=/usr/bin/env alert --unit %i
+
+TimeoutStartSec=300

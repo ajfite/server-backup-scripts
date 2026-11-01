@@ -29,4 +29,10 @@ sudo systemctl enable --now server-backup.timer server-update.timer
   keeps existing config files, never removes packages, and never reboots: check the
   log for a warning that a reboot is required. It exits non-zero if anything failed.
 
+- If `server-backup.service` or `server-update.service` fails, including by timing
+  out or being killed, `server-alert@.service` emails the result and that run's log
+  to `aj@nclf.net` from `server-alerts@nclf.net`. Successful runs send nothing.
+  Alerts go through the local Postfix, so a server that is down, or a timer that
+  stops firing, sends nothing.
+
 Do not run the tests as root on a production host.
