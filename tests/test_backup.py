@@ -1,4 +1,7 @@
 import os
+import pwd
+import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -6,318 +9,735 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from server_backup_scripts.backup_server import (
+    STANDARD_BACKUP_TYPES,
     Collect,
+    CollectResult,
     ExportManager,
     Rotate,
     main,
 )
 from server_backup_scripts.file_utils import (
     get_backup_files,
-    link_file_space_efficient,
+    get_most_recent_files,
+    move_file_atomic,
+    remove_stale_temp_files,
     rotate_directory_backups,
 )
+from server_backup_scripts.process_utils import (
+    run_pipeline_to_zstd,
+    run_process_with_stdout,
+)
+
+MODULE = "server_backup_scripts.backup_server"
+OLD_TIME = 1000
 
 
-class TestFileUtils(unittest.TestCase):
+def write_file(path, content="data", mtime=None, mode=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    if mode is not None:
+        os.chmod(path, mode)
+    return path
+
+
+def file_mode(path):
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def read_archive(path):
+    return subprocess.run(
+        f"zstd -dc '{path}'", shell=True, capture_output=True, check=True
+    ).stdout
+
+
+def archive_members(path):
+    return subprocess.run(
+        f"zstd -dc '{path}' | tar -t",
+        shell=True,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.split()
+
+
+class TempDirTestCase(unittest.TestCase):
     def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = os.path.realpath(self._tmp.name)
+        self.backup_dir = os.path.join(self.root, "backups")
+        self.export_dir = os.path.join(self.root, "export")
+        self.amp_dir = os.path.join(self.root, "amp_instances")
 
-    def tearDown(self):
-        self.test_dir.cleanup()
+    def fake_binary(self, name, script):
+        bin_dir = os.path.join(self.root, "bin")
+        write_file(os.path.join(bin_dir, name), f"#!/bin/sh\n{script}\n", mode=0o755)
+        patcher = patch.dict(os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
+
+class TestFileUtils(TempDirTestCase):
     def test_get_backup_files_and_rotation(self):
-        dir_path = self.test_dir.name
-        files = []
-        for i in range(5):
-            f_path = os.path.join(dir_path, f"backup_{i}.tar.zst")
-            with open(f_path, "w") as f:
-                f.write(f"data {i}")
-            os.utime(f_path, (1000 + i * 10, 1000 + i * 10))
-            files.append(f_path)
+        files = [
+            write_file(
+                os.path.join(self.root, f"backup_{i}.tar.zst"),
+                mtime=OLD_TIME + i * 10,
+            )
+            for i in range(5)
+        ]
+        log_path = write_file(os.path.join(self.root, "backup_service.log"))
+        tmp_path = write_file(os.path.join(self.root, "partial.tar.zst.tmp"))
 
-        log_path = os.path.join(dir_path, "backup_service.log")
-        with open(log_path, "w") as f:
-            f.write("log data")
+        discovered = get_backup_files(self.root)
+        self.assertEqual(discovered, list(reversed(files)))
 
-        discovered = get_backup_files(dir_path)
-        self.assertEqual(len(discovered), 5)
-        self.assertEqual(discovered[0], files[4])
-        self.assertEqual(discovered[-1], files[0])
-
-        removed = rotate_directory_backups(dir_path, keep_count=3)
-        self.assertEqual(len(removed), 2)
-        self.assertIn(files[0], removed)
-        self.assertIn(files[1], removed)
-
-        remaining = get_backup_files(dir_path)
-        self.assertEqual(len(remaining), 3)
+        removed = rotate_directory_backups(self.root, keep_count=3)
+        self.assertCountEqual(removed, files[:2])
+        self.assertEqual(len(get_backup_files(self.root)), 3)
         self.assertTrue(os.path.exists(log_path))
+        self.assertTrue(os.path.exists(tmp_path))
 
-    def test_link_file_space_efficient(self):
-        src = os.path.join(self.test_dir.name, "source.tar.zst")
-        dst = os.path.join(self.test_dir.name, "export", "source.tar.zst")
-        with open(src, "w") as f:
-            f.write("content")
+    def test_rotation_refuses_to_keep_nothing(self):
+        path = write_file(os.path.join(self.root, "a.tar.zst"))
+        self.assertEqual(rotate_directory_backups(self.root, keep_count=0), [])
+        self.assertTrue(os.path.exists(path))
 
-        success = link_file_space_efficient(src, dst)
-        self.assertTrue(success)
-        self.assertTrue(os.path.exists(dst))
+    def test_listing_ignores_symlinks(self):
+        target = write_file(os.path.join(self.root, "target.txt"))
+        os.symlink(target, os.path.join(self.root, "link.zip"))
+        self.assertEqual(get_backup_files(self.root), [])
+        self.assertEqual(get_most_recent_files(self.root, glob_str="*.zip"), [])
 
-        src_stat = os.stat(src)
-        dst_stat = os.stat(dst)
-        self.assertEqual(src_stat.st_ino, dst_stat.st_ino)
+    def test_old_bz2_snapshots_can_rotate(self):
+        path = write_file(os.path.join(self.root, "old.sqlite3.bz2"))
+        self.assertEqual(get_backup_files(self.root), [path])
 
-        self.assertTrue(link_file_space_efficient(src, dst))
+    def test_remove_stale_temp_files(self):
+        stale = write_file(os.path.join(self.root, "a.sql.zst.tmp"))
+        kept = write_file(os.path.join(self.root, "b.sql.zst"))
+        remove_stale_temp_files(self.root)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(kept))
+
+    def test_move_file_atomic_across_devices(self):
+        src = write_file(os.path.join(self.root, "src.tar"), "content")
+        dest = os.path.join(self.root, "dest.tar")
+        with patch("os.rename", side_effect=OSError(18, "cross-device")):
+            move_file_atomic(src, dest)
+        self.assertFalse(os.path.exists(src))
+        self.assertFalse(os.path.exists(f"{dest}.tmp"))
+        with open(dest) as f:
+            self.assertEqual(f.read(), "content")
 
 
-class TestBackupCollect(unittest.TestCase):
+class TestProcessUtils(TempDirTestCase):
     def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory()
-        self.backup_dir = os.path.join(self.test_dir.name, "backups")
-        self.amp_dir = os.path.join(self.test_dir.name, "amp_instances")
-        os.makedirs(self.backup_dir)
-        os.makedirs(self.amp_dir)
+        super().setUp()
+        self.dest = os.path.join(self.root, "out.sql.zst")
 
-    def tearDown(self):
-        self.test_dir.cleanup()
+    def test_pipeline_writes_private_verified_archive(self):
+        self.assertTrue(run_pipeline_to_zstd(["echo", "hello"], self.dest))
+        self.assertEqual(read_archive(self.dest), b"hello\n")
+        self.assertEqual(file_mode(self.dest), 0o600)
+        self.assertFalse(os.path.exists(f"{self.dest}.tmp"))
 
-    def test_create_directories_and_amp_links(self):
-        inst_dir = os.path.join(self.amp_dir, "MyInstance", "Backups")
-        os.makedirs(inst_dir)
-        with open(os.path.join(inst_dir, "backup1.zip"), "w") as f:
-            f.write("amp backup")
+    def test_producer_failure_leaves_nothing(self):
+        self.assertFalse(run_pipeline_to_zstd(["false"], self.dest))
+        self.assertEqual(os.listdir(self.root), [])
 
-        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
+    def test_ok_codes_apply_to_producer(self):
+        self.fake_binary("exit1", "echo data; exit 1")
+        self.assertFalse(run_pipeline_to_zstd(["exit1"], self.dest))
+        self.assertTrue(run_pipeline_to_zstd(["exit1"], self.dest, ok_codes=(0, 1)))
+        self.assertEqual(read_archive(self.dest), b"data\n")
 
-        for b_type in collector.standard_backup_types:
-            self.assertTrue(os.path.isdir(os.path.join(self.backup_dir, b_type)))
-
-        amp_link = os.path.join(self.backup_dir, "amp", "MyInstance")
-        self.assertTrue(os.path.islink(amp_link))
-        self.assertEqual(os.readlink(amp_link), inst_dir)
-
-    @patch("shutil.which")
-    @patch("server_backup_scripts.backup_server.run_process_with_stdout")
-    def test_mariadb_collector(self, mock_run, mock_which):
-        mock_which.side_effect = lambda cmd: (
-            f"/usr/bin/{cmd}" if cmd == "mariadb-dump" else None
+    def test_zstd_exit_one_is_never_acceptable(self):
+        self.fake_binary("zstd", "cat >/dev/null; echo partial; exit 1")
+        self.assertFalse(
+            run_pipeline_to_zstd(["echo", "data"], self.dest, ok_codes=(0, 1))
         )
-        mock_run.return_value = ("dump output", 0)
+        self.assertFalse(os.path.exists(self.dest))
+        self.assertFalse(os.path.exists(f"{self.dest}.tmp"))
 
-        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
-        mariadb_dir = os.path.join(self.backup_dir, "mariadb")
-        with patch(
-            "server_backup_scripts.backup_server.get_datetime_str",
-            return_value="20261031-120000+0000",
-        ):
-            expected_file = os.path.join(
-                mariadb_dir, "20261031-120000+0000-mariadb.sql.zst"
-            )
-            with open(expected_file, "w") as f:
-                f.write("sql dump")
-            success = collector.mariadb()
+    def test_corrupt_output_fails_verification(self):
+        self.fake_binary(
+            "zstd",
+            'if [ "$1" = "-t" ]; then exit 1; fi; cat >/dev/null; echo garbage',
+        )
+        self.assertFalse(run_pipeline_to_zstd(["echo", "data"], self.dest))
+        self.assertFalse(os.path.exists(self.dest))
 
-        self.assertTrue(success)
-        mock_run.assert_called_once()
-        self.assertIn("mariadb-dump --all-databases", mock_run.call_args[0][0][0])
+    def test_missing_producer_fails_cleanly(self):
+        self.assertFalse(run_pipeline_to_zstd(["no-such-command-xyz"], self.dest))
+        self.assertEqual(os.listdir(self.root), [])
 
-    @patch("shutil.which")
-    @patch("server_backup_scripts.backup_server.run_process_with_stdout")
-    def test_etc_collector(self, mock_run, mock_which):
-        mock_which.return_value = "/usr/bin/tar"
-        mock_run.return_value = ("tar output", 0)
+    def test_shell_metacharacters_are_not_interpreted(self):
+        dest = os.path.join(self.root, "a b; touch pwned.zst")
+        self.assertTrue(run_pipeline_to_zstd(["echo", "x"], dest))
+        self.assertTrue(os.path.exists(dest))
 
-        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
-        etc_dir = os.path.join(self.backup_dir, "etc")
-        with patch(
-            "server_backup_scripts.backup_server.get_datetime_str",
-            return_value="20261031-120000+0000",
-        ):
-            expected_file = os.path.join(etc_dir, "20261031-120000+0000-etc.tar.zst")
-            with open(expected_file, "w") as f:
-                f.write("tar archive")
-            success = collector.etc()
+    def test_missing_command_returns_127(self):
+        self.assertEqual(run_process_with_stdout(["no-such-command-xyz"])[1], 127)
 
-        self.assertTrue(success)
-        self.assertIn("tar", mock_run.call_args[0][0][0])
-
-    @patch("shutil.which")
-    @patch("server_backup_scripts.backup_server.run_process_with_stdout")
-    def test_www_collector(self, mock_run, mock_which):
-        mock_which.return_value = "/usr/bin/tar"
-        mock_run.return_value = ("tar output", 0)
-
-        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
-        www_dir = os.path.join(self.backup_dir, "www")
-        with patch("os.path.isdir", side_effect=lambda p: True):
-            with patch(
-                "server_backup_scripts.backup_server.get_datetime_str",
-                return_value="20261031-120000+0000",
-            ):
-                expected_file = os.path.join(
-                    www_dir, "20261031-120000+0000-www.tar.zst"
-                )
-                with open(expected_file, "w") as f:
-                    f.write("tar archive")
-                success = collector.www()
-
-        self.assertTrue(success)
-        cmd_str = mock_run.call_args[0][0][0]
-        self.assertIn("tar", cmd_str)
-        self.assertIn("www", cmd_str)
-        self.assertIn("zstd -19 -T0", cmd_str)
-
-    @patch("shutil.which")
-    @patch("server_backup_scripts.backup_server.run_process_with_stdout")
-    def test_postgres_collector(self, mock_run, mock_which):
-        mock_which.return_value = "/usr/bin/pg_dumpall"
-        mock_run.return_value = ("pg output", 0)
-
-        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
-        pg_dir = os.path.join(self.backup_dir, "postgres")
-        with patch(
-            "server_backup_scripts.backup_server.get_datetime_str",
-            return_value="20261031-120000+0000",
-        ):
-            expected_file = os.path.join(
-                pg_dir, "20261031-120000+0000-postgres.sql.zst"
-            )
-            with open(expected_file, "w") as f:
-                f.write("pg dump")
-            success = collector.postgres()
-
-        self.assertTrue(success)
-        self.assertIn("pg_dumpall", mock_run.call_args[0][0][0])
-
-    @patch("shutil.which")
-    @patch("server_backup_scripts.backup_server.run_process_with_stdout")
-    @patch("server_backup_scripts.backup_server.get_most_recent_files")
-    def test_gitlab_collector(self, mock_recent, mock_run, mock_which):
-        mock_which.return_value = "/usr/bin/gitlab-backup"
-        mock_run.return_value = ("gitlab output", 0)
-
-        src_backup = os.path.join(self.test_dir.name, "gitlab_backup.tar")
-        with open(src_backup, "w") as f:
-            f.write("gitlab archive")
-        mock_recent.return_value = [src_backup]
-
-        collector = Collect(backup_dir=self.backup_dir, amp_dir=self.amp_dir)
-        success = collector.gitlab()
-
-        self.assertTrue(success)
-        expected_dest = os.path.join(self.backup_dir, "gitlab", "gitlab_backup.tar")
-        self.assertTrue(os.path.exists(expected_dest))
+    def test_undecodable_output_does_not_raise(self):
+        self.fake_binary("badbytes", r"printf '\377\376\n'")
+        out, code = run_process_with_stdout(["badbytes"])
+        self.assertEqual(code, 0)
+        self.assertIn("�", out)
 
 
-class TestExportManager(unittest.TestCase):
+class TestCollectors(TempDirTestCase):
     def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory()
-        self.backup_dir = os.path.join(self.test_dir.name, "backups")
-        self.export_dir = os.path.join(self.test_dir.name, "export")
-        os.makedirs(self.backup_dir)
+        super().setUp()
+        self.collector = Collect(backup_dir=self.backup_dir)
+        self.collector.prepare()
 
-    def tearDown(self):
-        self.test_dir.cleanup()
+    def test_prepare_creates_private_dirs(self):
+        self.assertEqual(file_mode(self.backup_dir), 0o700)
+        for b_type in STANDARD_BACKUP_TYPES:
+            self.assertEqual(file_mode(os.path.join(self.backup_dir, b_type)), 0o700)
 
-    def test_sync_and_prune(self):
-        vw_dir = os.path.join(self.backup_dir, "vaultwarden")
-        os.makedirs(vw_dir)
-        b1 = os.path.join(vw_dir, "backup1.tar.zst")
-        b2 = os.path.join(vw_dir, "backup2.tar.zst")
-        with open(b1, "w") as f:
-            f.write("b1")
-        with open(b2, "w") as f:
-            f.write("b2")
+    def test_prepare_removes_legacy_amp_links(self):
+        legacy = os.path.join(self.backup_dir, "amp")
+        os.makedirs(legacy)
+        target = os.path.join(self.root, "amp_backups")
+        os.makedirs(target)
+        os.symlink(target, os.path.join(legacy, "Instance"))
+        self.collector.prepare()
+        self.assertFalse(os.path.exists(legacy))
+        self.assertTrue(os.path.isdir(target))
 
-        exporter = ExportManager(
+    def test_prepare_rejects_file_in_place_of_directory(self):
+        path = os.path.join(self.root, "other")
+        write_file(os.path.join(path, "etc"))
+        with self.assertRaises(OSError):
+            Collect(backup_dir=path).prepare()
+
+    def test_prepare_clears_partial_archives(self):
+        stale = write_file(os.path.join(self.backup_dir, "etc", "x.tar.zst.tmp"))
+        self.collector.prepare()
+        self.assertFalse(os.path.exists(stale))
+
+    @patch(f"{MODULE}.shutil.which", return_value="/usr/bin/mariadb-dump")
+    @patch(f"{MODULE}.run_pipeline_to_zstd", return_value=True)
+    def test_mariadb_collector(self, mock_pipeline, _which):
+        self.assertIs(self.collector.mariadb(), CollectResult.OK)
+        self.assertEqual(
+            mock_pipeline.call_args[0][0],
+            ["mariadb-dump", "--all-databases", "--single-transaction", "--quick"],
+        )
+
+    @patch(f"{MODULE}.shutil.which", return_value="/usr/bin/pg_dumpall")
+    @patch(f"{MODULE}.run_pipeline_to_zstd", return_value=False)
+    def test_postgres_failure_is_reported(self, mock_pipeline, _which):
+        self.assertIs(self.collector.postgres(), CollectResult.FAILED)
+        self.assertEqual(
+            mock_pipeline.call_args[0][0], ["sudo", "-u", "postgres", "pg_dumpall"]
+        )
+
+    @patch(f"{MODULE}.shutil.which", return_value=None)
+    def test_missing_tool_is_skip_not_failure(self, _which):
+        with patch(f"{MODULE}.GITLAB_BACKUP_COMMAND", "/no/such/gitlab-backup"):
+            self.assertEqual(self.collector.collect_all(), [])
+
+    def test_archive_directory_real_pipeline(self):
+        target = os.path.join(self.root, "src", "www")
+        write_file(os.path.join(target, "index.html"))
+        self.assertIs(self.collector.archive_directory(target, "www"), CollectResult.OK)
+        archive = get_backup_files(os.path.join(self.backup_dir, "www"))[0]
+        self.assertIn("www/index.html", archive_members(archive))
+        self.assertEqual(file_mode(archive), 0o600)
+
+    def test_archive_directory_tolerates_tar_exit_one(self):
+        self.fake_binary("tar", "echo data; echo 'file changed' >&2; exit 1")
+        target = os.path.join(self.root, "www")
+        os.makedirs(target)
+        self.assertIs(self.collector.archive_directory(target, "www"), CollectResult.OK)
+
+    def test_archive_directory_rejects_tar_exit_two(self):
+        self.fake_binary("tar", "echo data; exit 2")
+        target = os.path.join(self.root, "www")
+        os.makedirs(target)
+        self.assertIs(
+            self.collector.archive_directory(target, "www"), CollectResult.FAILED
+        )
+        self.assertEqual(os.listdir(os.path.join(self.backup_dir, "www")), [])
+
+    def test_archive_directory_missing_target_skips(self):
+        self.assertIs(
+            self.collector.archive_directory("/no/such/dir", "www"),
+            CollectResult.SKIPPED,
+        )
+
+    def test_one_collector_raising_does_not_stop_others(self):
+        ran = []
+
+        def record(name, result=CollectResult.OK):
+            def collector():
+                ran.append(name)
+                return result
+
+            return collector
+
+        def boom():
+            raise OSError("disk full")
+
+        with (
+            patch.object(self.collector, "gitlab", boom),
+            patch.object(self.collector, "postgres", record("postgres")),
+            patch.object(self.collector, "vaultwarden", record("vaultwarden")),
+            patch.object(self.collector, "etc", record("etc")),
+            patch.object(self.collector, "www", record("www")),
+            patch.object(
+                self.collector, "mariadb", record("mariadb", CollectResult.FAILED)
+            ),
+        ):
+            self.assertEqual(self.collector.collect_all(), ["gitlab", "mariadb"])
+        self.assertEqual(len(ran), 5)
+
+
+class TestGitlabCollector(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.collector = Collect(backup_dir=self.backup_dir)
+        self.collector.prepare()
+        self.gitlab_dir = os.path.join(self.root, "gitlab_src")
+        self.old = write_file(
+            os.path.join(self.gitlab_dir, "old_gitlab_backup.tar"), mtime=OLD_TIME
+        )
+        for patcher in (
+            patch(f"{MODULE}.GITLAB_BACKUP_DIR", self.gitlab_dir),
+            patch(f"{MODULE}.shutil.which", return_value="/usr/bin/gitlab-backup"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def creates_backup(self, _cmd):
+        write_file(os.path.join(self.gitlab_dir, "new_gitlab_backup.tar"), mode=0o600)
+        return "", 0
+
+    def test_new_backup_is_moved_and_private(self):
+        with patch(f"{MODULE}.run_process_with_stdout", self.creates_backup):
+            self.assertIs(self.collector.gitlab(), CollectResult.OK)
+        dest = os.path.join(self.backup_dir, "gitlab", "new_gitlab_backup.tar")
+        self.assertEqual(file_mode(dest), 0o600)
+        self.assertEqual(os.listdir(self.gitlab_dir), ["old_gitlab_backup.tar"])
+
+    def test_old_backup_is_not_mistaken_for_new(self):
+        with patch(f"{MODULE}.run_process_with_stdout", return_value=("", 0)):
+            self.assertIs(self.collector.gitlab(), CollectResult.FAILED)
+        self.assertEqual(os.listdir(os.path.join(self.backup_dir, "gitlab")), [])
+        self.assertTrue(os.path.exists(self.old))
+
+    def test_command_failure(self):
+        with patch(f"{MODULE}.run_process_with_stdout", return_value=("", 1)):
+            self.assertIs(self.collector.gitlab(), CollectResult.FAILED)
+
+    def test_runs_the_path_that_was_found(self):
+        omnibus = write_file(os.path.join(self.root, "opt", "gitlab-backup"))
+        with (
+            patch(f"{MODULE}.shutil.which", return_value=None),
+            patch(f"{MODULE}.GITLAB_BACKUP_COMMAND", omnibus),
+            patch(f"{MODULE}.run_process_with_stdout", return_value=("", 1)) as run,
+        ):
+            self.collector.gitlab()
+        self.assertEqual(run.call_args[0][0], [omnibus, "create"])
+
+
+class TestVaultwardenCollector(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.collector = Collect(backup_dir=self.backup_dir)
+        self.collector.prepare()
+        self.vw_dir = os.path.join(self.root, "vw-data")
+        self.live_db = write_file(os.path.join(self.vw_dir, "db.sqlite3"), "LIVE")
+        write_file(os.path.join(self.vw_dir, "rsa_key.pem"))
+        write_file(os.path.join(self.vw_dir, "attachments", "a.bin"))
+        self.snapshot = os.path.join(self.vw_dir, "db_20261031_000000.sqlite3")
+        for patcher in (
+            patch(f"{MODULE}.VAULTWARDEN_BACKUP_DIR", self.vw_dir),
+            patch(f"{MODULE}.shutil.which", return_value="/usr/bin/docker"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def docker_writes_snapshot(self, _cmd):
+        # The live database is touched after the snapshot, so it is newest.
+        write_file(self.snapshot, "SNAP", mtime=OLD_TIME)
+        os.utime(self.live_db)
+        return "", 0
+
+    def archives(self):
+        return get_backup_files(os.path.join(self.backup_dir, "vaultwarden"))
+
+    def test_live_database_is_never_archived_or_deleted(self):
+        with patch(f"{MODULE}.run_process_with_stdout", self.docker_writes_snapshot):
+            self.assertIs(self.collector.vaultwarden(), CollectResult.OK)
+        self.assertTrue(os.path.exists(self.live_db))
+        self.assertFalse(os.path.exists(self.snapshot))
+        members = archive_members(self.archives()[0])
+        self.assertIn(os.path.basename(self.snapshot), members)
+        self.assertIn("rsa_key.pem", members)
+        self.assertNotIn("db.sqlite3", members)
+
+    def test_archive_members_are_relative(self):
+        with patch(f"{MODULE}.run_process_with_stdout", self.docker_writes_snapshot):
+            self.collector.vaultwarden()
+        for member in archive_members(self.archives()[0]):
+            self.assertNotIn(self.vw_dir.lstrip("/"), member)
+
+    def test_missing_optional_members_are_fine(self):
+        self.assertFalse(os.path.exists(os.path.join(self.vw_dir, "config.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.vw_dir, "sends")))
+        with patch(f"{MODULE}.run_process_with_stdout", self.docker_writes_snapshot):
+            self.assertIs(self.collector.vaultwarden(), CollectResult.OK)
+        self.assertFalse(os.path.exists(os.path.join(self.vw_dir, "sends")))
+
+    def test_no_new_snapshot_fails_and_touches_nothing(self):
+        stale = write_file(
+            os.path.join(self.vw_dir, "db_20260221_070336.sqlite3"), mtime=OLD_TIME
+        )
+        with patch(f"{MODULE}.run_process_with_stdout", return_value=("", 0)):
+            self.assertIs(self.collector.vaultwarden(), CollectResult.FAILED)
+        self.assertTrue(os.path.exists(self.live_db))
+        self.assertTrue(os.path.exists(stale))
+        self.assertEqual(self.archives(), [])
+
+    def test_tar_failure_cleans_up_snapshot(self):
+        self.fake_binary("tar", "exit 2")
+        with patch(f"{MODULE}.run_process_with_stdout", self.docker_writes_snapshot):
+            self.assertIs(self.collector.vaultwarden(), CollectResult.FAILED)
+        self.assertFalse(os.path.exists(self.snapshot))
+        self.assertTrue(os.path.exists(self.live_db))
+        self.assertEqual(self.archives(), [])
+
+
+class TestRotation(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.pg_dir = os.path.join(self.backup_dir, "postgres")
+        for i in range(4):
+            write_file(
+                os.path.join(self.pg_dir, f"file_{i}.sql.zst"),
+                mtime=OLD_TIME + i * 10,
+            )
+
+    def test_rotate_all(self):
+        results = Rotate(backup_dir=self.backup_dir, keep=2).rotate_all()
+        self.assertEqual(len(results["postgres"]), 2)
+        self.assertCountEqual(
+            os.listdir(self.pg_dir), ["file_3.sql.zst", "file_2.sql.zst"]
+        )
+
+    def test_skipped_type_keeps_everything(self):
+        Rotate(backup_dir=self.backup_dir, keep=2).rotate_all(["postgres"])
+        self.assertEqual(len(os.listdir(self.pg_dir)), 4)
+
+
+@unittest.skipIf(os.geteuid() == 0, "covered by TestExportOwnershipAsRoot")
+class TestExportManager(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.vw_dir = os.path.join(self.backup_dir, "vaultwarden")
+        self.b1 = write_file(os.path.join(self.vw_dir, "backup1.tar.zst"), mode=0o600)
+        self.b2 = write_file(os.path.join(self.vw_dir, "backup2.tar.zst"), mode=0o600)
+        self.exporter = ExportManager(
             backup_dir=self.backup_dir,
             export_dir=self.export_dir,
             export_user="testuser",
+            amp_dir=self.amp_dir,
         )
-        exporter.sync_all()
+        self.exp_vw = os.path.join(self.export_dir, "vaultwarden")
 
-        exp_b1 = os.path.join(self.export_dir, "vaultwarden", "backup1.tar.zst")
-        exp_b2 = os.path.join(self.export_dir, "vaultwarden", "backup2.tar.zst")
-        self.assertTrue(os.path.exists(exp_b1))
-        self.assertTrue(os.path.exists(exp_b2))
+    def amp_backup(self, instance, name="save.zip", mtime=OLD_TIME):
+        return write_file(
+            os.path.join(self.amp_dir, instance, "Backups", name), mtime=mtime
+        )
 
-        self.assertEqual(os.stat(b1).st_ino, os.stat(exp_b1).st_ino)
+    def test_sync_and_prune(self):
+        self.assertEqual(self.exporter.sync_all(), [])
+        exp_b1 = os.path.join(self.exp_vw, "backup1.tar.zst")
+        exp_b2 = os.path.join(self.exp_vw, "backup2.tar.zst")
+        self.assertEqual(os.stat(self.b1).st_ino, os.stat(exp_b1).st_ino)
+        self.assertEqual(file_mode(exp_b1), 0o640)
+        self.assertEqual(file_mode(self.export_dir), 0o750)
+        self.assertEqual(file_mode(self.exp_vw), 0o750)
 
-        os.remove(b1)
-        exporter.sync_all()
-
+        os.remove(self.b1)
+        self.assertEqual(self.exporter.sync_all(), [])
         self.assertFalse(os.path.exists(exp_b1))
         self.assertTrue(os.path.exists(exp_b2))
 
+    def test_empty_source_does_not_wipe_export(self):
+        self.exporter.sync_all()
+        os.remove(self.b1)
+        os.remove(self.b2)
+        self.exporter.sync_all()
+        self.assertEqual(len(os.listdir(self.exp_vw)), 2)
 
-class TestRotation(unittest.TestCase):
+    def test_prune_leaves_non_backup_files(self):
+        self.exporter.sync_all()
+        marker = write_file(os.path.join(self.exp_vw, "sync-marker"))
+        self.exporter.sync_all()
+        self.assertTrue(os.path.exists(marker))
+
+    def test_replaces_stale_file_of_same_name(self):
+        stale = write_file(os.path.join(self.exp_vw, "backup1.tar.zst"), "stale")
+        self.exporter.sync_all()
+        self.assertEqual(os.stat(stale).st_ino, os.stat(self.b1).st_ino)
+
+    def test_replaced_type_dir_symlink_is_refused(self):
+        victim_dir = os.path.join(self.root, "victim")
+        victim = write_file(os.path.join(victim_dir, "keep.tar.zst"), mode=0o600)
+        os.chmod(victim_dir, 0o700)
+        os.makedirs(self.export_dir)
+        os.symlink(victim_dir, self.exp_vw)
+
+        self.assertEqual(self.exporter.sync_all(), ["export:vaultwarden"])
+        self.assertEqual(file_mode(victim_dir), 0o700)
+        self.assertTrue(os.path.exists(victim))
+        self.assertEqual(os.listdir(victim_dir), ["keep.tar.zst"])
+
+    def test_replaced_export_root_symlink_is_refused(self):
+        victim_dir = os.path.join(self.root, "victim")
+        os.makedirs(victim_dir, mode=0o700)
+        os.symlink(victim_dir, self.export_dir)
+        with self.assertRaises(OSError):
+            self.exporter.sync_all()
+        self.assertEqual(file_mode(victim_dir), 0o700)
+
+    def test_amp_zip_exported_without_rotation(self):
+        zips = [self.amp_backup("Inst", f"save{i}.zip", OLD_TIME + i) for i in range(7)]
+        Rotate(backup_dir=self.backup_dir, keep=2).rotate_all()
+        self.assertEqual(self.exporter.sync_all(), [])
+        for path in zips:
+            self.assertTrue(os.path.exists(path))
+        exported = os.path.join(self.export_dir, "amp", "Inst", "save0.zip")
+        self.assertEqual(os.stat(exported).st_ino, os.stat(zips[0]).st_ino)
+
+    def test_amp_ignores_sidecars_and_recent_zips(self):
+        self.amp_backup("Inst", "old.zip")
+        self.amp_backup("Inst", "writing.zip", mtime=None)
+        self.amp_backup("Inst", "manifest.json")
+        self.exporter.sync_all()
+        self.assertEqual(
+            os.listdir(os.path.join(self.export_dir, "amp", "Inst")), ["old.zip"]
+        )
+
+    def test_amp_zip_symlink_cannot_change_target(self):
+        victim = write_file(os.path.join(self.root, "shadow"), "secret", mode=0o600)
+        backups = os.path.join(self.amp_dir, "Inst", "Backups")
+        os.makedirs(backups)
+        os.symlink(victim, os.path.join(backups, "evil.zip"))
+
+        self.assertEqual(self.exporter.sync_all(), ["export:amp"])
+        self.assertEqual(file_mode(victim), 0o600)
+        self.assertEqual(os.listdir(os.path.join(self.export_dir, "amp", "Inst")), [])
+
+    def test_amp_backups_symlink_is_ignored(self):
+        outside = os.path.join(self.root, "outside")
+        write_file(os.path.join(outside, "other.zip"), mode=0o600)
+        os.makedirs(os.path.join(self.amp_dir, "Inst"))
+        os.symlink(outside, os.path.join(self.amp_dir, "Inst", "Backups"))
+
+        self.exporter.sync_all()
+        self.assertEqual(os.listdir(outside), ["other.zip"])
+        self.assertEqual(file_mode(os.path.join(outside, "other.zip")), 0o600)
+        self.assertFalse(os.path.exists(os.path.join(self.export_dir, "amp", "Inst")))
+
+    def test_amp_deleted_instance_is_pruned(self):
+        self.amp_backup("Gone")
+        self.amp_backup("Stays")
+        self.exporter.sync_all()
+        write_file(os.path.join(self.amp_dir, "Gone", "not-a-dir"))
+        os.rename(
+            os.path.join(self.amp_dir, "Gone", "Backups"),
+            os.path.join(self.root, "moved"),
+        )
+        self.exporter.sync_all()
+        self.assertEqual(os.listdir(os.path.join(self.export_dir, "amp")), ["Stays"])
+
+    def test_amp_no_instances_does_not_wipe_export(self):
+        self.amp_backup("Inst")
+        self.exporter.sync_all()
+        os.rename(self.amp_dir, f"{self.amp_dir}.moved")
+        os.makedirs(self.amp_dir)
+        self.exporter.sync_all()
+        self.assertEqual(os.listdir(os.path.join(self.export_dir, "amp")), ["Inst"])
+
+
+@unittest.skipUnless(os.geteuid() == 0, "ownership is only applied as root")
+class TestExportOwnershipAsRoot(TempDirTestCase):
     def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory()
-        self.backup_dir = os.path.join(self.test_dir.name, "backups")
-        os.makedirs(self.backup_dir)
+        super().setUp()
+        os.chmod(self.root, 0o755)
+        self.export_user = pwd.getpwnam("nobody")
+        self.amp_user = pwd.getpwnam("daemon")
+        self.backup = write_file(
+            os.path.join(self.backup_dir, "etc", "x.tar.zst"), mode=0o600
+        )
+        self.exporter = ExportManager(
+            backup_dir=self.backup_dir,
+            export_dir=self.export_dir,
+            export_user="nobody",
+            amp_dir=self.amp_dir,
+        )
 
-    def tearDown(self):
-        self.test_dir.cleanup()
+    def amp_zip(self, uid):
+        backups = os.path.join(self.amp_dir, "Inst", "Backups")
+        path = write_file(os.path.join(backups, "save.zip"), mtime=OLD_TIME)
+        for owned in (os.path.dirname(backups), backups):
+            os.chown(owned, self.amp_user.pw_uid, self.amp_user.pw_gid)
+        os.chown(path, uid, uid)
+        return path
 
-    def test_rotate_all(self):
-        pg_dir = os.path.join(self.backup_dir, "postgres")
-        os.makedirs(pg_dir)
-        created = []
-        for i in range(4):
-            path = os.path.join(pg_dir, f"file_{i}.sql.zst")
-            with open(path, "w") as f:
-                f.write("pg")
-            os.utime(path, (1000 + i * 10, 1000 + i * 10))
-            created.append(path)
+    def test_export_is_root_owned_and_group_readable(self):
+        self.assertEqual(self.exporter.sync_all(), [])
+        for path in (self.export_dir, os.path.join(self.export_dir, "etc")):
+            st = os.stat(path)
+            self.assertEqual((st.st_uid, st.st_gid), (0, self.export_user.pw_gid), path)
+        st = os.stat(self.backup)
+        self.assertEqual((st.st_uid, st.st_gid), (0, self.export_user.pw_gid))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o640)
 
-        rotator = Rotate(backup_dir=self.backup_dir, keep=2)
-        results = rotator.rotate_all()
+    def test_amp_zip_stays_owned_by_amp(self):
+        path = self.amp_zip(self.amp_user.pw_uid)
+        self.assertEqual(self.exporter.sync_all(), [])
+        st = os.stat(path)
+        self.assertEqual(
+            (st.st_uid, st.st_gid), (self.amp_user.pw_uid, self.export_user.pw_gid)
+        )
 
-        self.assertEqual(len(results.get("postgres", [])), 2)
-        remaining = os.listdir(pg_dir)
-        self.assertEqual(len(remaining), 2)
-        self.assertIn("file_3.sql.zst", remaining)
-        self.assertIn("file_2.sql.zst", remaining)
+    def test_amp_zip_previously_chowned_to_export_user_is_restored(self):
+        path = self.amp_zip(self.export_user.pw_uid)
+        self.assertEqual(self.exporter.sync_all(), [])
+        self.assertEqual(os.stat(path).st_uid, self.amp_user.pw_uid)
+
+    def test_root_owned_file_in_amp_dir_is_not_exported(self):
+        path = self.amp_zip(0)
+        os.chmod(path, 0o600)
+        self.exporter.sync_all()
+        self.assertEqual(file_mode(path), 0o600)
+        self.assertEqual(os.stat(path).st_uid, 0)
+        self.assertEqual(os.listdir(os.path.join(self.export_dir, "amp", "Inst")), [])
+
+    def test_symlink_zip_cannot_take_over_target(self):
+        victim = write_file(os.path.join(self.root, "shadow"), "secret", mode=0o600)
+        path = self.amp_zip(self.amp_user.pw_uid)
+        os.remove(path)
+        os.symlink(victim, path)
+        self.assertEqual(self.exporter.sync_all(), ["export:amp"])
+        st = os.stat(victim)
+        self.assertEqual((st.st_uid, stat.S_IMODE(st.st_mode)), (0, 0o600))
+
+    def test_backups_dir_owned_by_root_is_refused(self):
+        path = self.amp_zip(0)
+        os.chown(os.path.dirname(path), 0, 0)
+        self.assertEqual(self.exporter.sync_all(), ["export:amp"])
+
+    def test_replaced_type_dir_symlink_is_refused(self):
+        victim_dir = os.path.join(self.root, "victim")
+        victim = write_file(os.path.join(victim_dir, "keep.tar.zst"), mode=0o600)
+        os.chmod(victim_dir, 0o700)
+        os.makedirs(self.export_dir)
+        os.symlink(victim_dir, os.path.join(self.export_dir, "etc"))
+
+        self.assertEqual(self.exporter.sync_all(), ["export:etc"])
+        st = os.stat(victim_dir)
+        self.assertEqual((st.st_uid, stat.S_IMODE(st.st_mode)), (0, 0o700))
+        self.assertEqual(os.stat(victim).st_uid, 0)
+        self.assertEqual(os.listdir(victim_dir), ["keep.tar.zst"])
+
+    def test_missing_export_user_fails(self):
+        exporter = ExportManager(
+            self.backup_dir, self.export_dir, "no-such-user-xyz", self.amp_dir
+        )
+        with self.assertRaises(KeyError):
+            exporter.sync_all()
 
 
-class TestCliIntegration(unittest.TestCase):
-    def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory()
-        self.backup_dir = os.path.join(self.test_dir.name, "backups")
-        self.export_dir = os.path.join(self.test_dir.name, "export")
-
-    def tearDown(self):
-        self.test_dir.cleanup()
-
-    def test_cli_skip_collect_rotation_export(self):
-        runner = CliRunner()
-        # Create directories and mock backups beforehand
-        os.makedirs(os.path.join(self.backup_dir, "etc"))
-        for i in range(4):
-            f_path = os.path.join(self.backup_dir, "etc", f"etc_{i}.tar.zst")
-            with open(f_path, "w") as f:
-                f.write(f"etc {i}")
-            os.utime(f_path, (1000 + i * 10, 1000 + i * 10))
-
-        result = runner.invoke(
+class TestCliIntegration(TempDirTestCase):
+    def run_cli(self, *extra):
+        return CliRunner().invoke(
             main,
             [
                 "--backup-dir",
                 self.backup_dir,
                 "--export-dir",
                 self.export_dir,
-                "--keep",
-                "2",
-                "--skip-collect",
+                "--amp-dir",
+                self.amp_dir,
+                "--export-user",
+                "nobody",
+                *extra,
             ],
         )
+
+    def etc_backups(self, count=4):
+        for i in range(count):
+            write_file(
+                os.path.join(self.backup_dir, "etc", f"etc_{i}.tar.zst"),
+                mtime=OLD_TIME + i * 10,
+            )
+
+    def test_cli_skip_collect_rotation_export(self):
+        self.etc_backups()
+        result = self.run_cli("--keep", "2", "--skip-collect")
         self.assertEqual(result.exit_code, 0)
-        # Check rotation occurred
-        remaining = os.listdir(os.path.join(self.backup_dir, "etc"))
-        self.assertEqual(len(remaining), 2)
-        # Check export directory created and contains remaining 2 backups
-        exported = os.listdir(os.path.join(self.export_dir, "etc"))
-        self.assertEqual(len(exported), 2)
+        self.assertEqual(len(os.listdir(os.path.join(self.backup_dir, "etc"))), 2)
+        self.assertEqual(len(os.listdir(os.path.join(self.export_dir, "etc"))), 2)
+        self.assertEqual(file_mode(self.backup_dir), 0o700)
+
+    @unittest.skipIf(os.geteuid() == 0, "AMP dirs must not be root-owned")
+    def test_skip_collect_does_not_touch_amp(self):
+        zips = [
+            write_file(
+                os.path.join(self.amp_dir, "Inst", "Backups", f"{i}.zip"),
+                mtime=OLD_TIME + i,
+            )
+            for i in range(4)
+        ]
+        self.assertEqual(self.run_cli("--keep", "1", "--skip-collect").exit_code, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.backup_dir, "amp")))
+        for path in zips:
+            self.assertTrue(os.path.exists(path))
+
+    def test_keep_zero_is_rejected(self):
+        self.etc_backups()
+        result = self.run_cli("--keep", "0", "--skip-collect")
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(len(os.listdir(os.path.join(self.backup_dir, "etc"))), 4)
+
+    def test_failed_collector_exits_nonzero_and_skips_its_rotation(self):
+        self.etc_backups(6)
+        with patch.object(Collect, "collect_all", return_value=["etc"]):
+            result = self.run_cli("--keep", "2")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(len(os.listdir(os.path.join(self.backup_dir, "etc"))), 6)
+        self.assertEqual(len(os.listdir(os.path.join(self.export_dir, "etc"))), 6)
+
+    def test_rotation_exception_exits_nonzero_but_still_exports(self):
+        self.etc_backups(1)
+        with patch.object(Rotate, "rotate_all", side_effect=OSError("boom")):
+            result = self.run_cli("--skip-collect")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(len(os.listdir(os.path.join(self.export_dir, "etc"))), 1)
+
+    def test_export_failure_exits_nonzero(self):
+        self.etc_backups(1)
+        os.makedirs(self.export_dir)
+        os.symlink(self.root, os.path.join(self.export_dir, "etc"))
+        result = self.run_cli("--skip-collect")
+        self.assertEqual(result.exit_code, 1)
+
+    def test_unhandled_exception_exits_nonzero(self):
+        with patch.object(Collect, "collect_all", side_effect=RuntimeError("boom")):
+            result = self.run_cli()
+        self.assertNotEqual(result.exit_code, 0)
 
 
 if __name__ == "__main__":

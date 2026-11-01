@@ -26,5 +26,4 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section: this only runs from server-backup.timer, not at boot

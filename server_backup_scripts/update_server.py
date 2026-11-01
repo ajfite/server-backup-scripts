@@ -5,9 +5,9 @@ from loguru import logger
 
 
 @click.command()
-@logger.catch
+@logger.catch(reraise=True)
 def main():
-    logger.info("Running update service")
+    raise click.ClickException("The update service is not implemented yet")
 
 
 class Update:
