@@ -10,11 +10,21 @@ Install or upgrade the `backup` and `update` commands as root, install the units
 and enable only the timers:
 
 ```sh
+sudo apt install age
 sudo pipx install --force git+https://git.nclf.net/ajfite/server-backup-scripts.git
 sudo cp systemd/server-*.service systemd/server-*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now server-backup-vaultwarden.timer server-backup-databases.timer \
     server-backup-weekly.timer server-update.timer
+```
+
+Put the age public keys that backups are encrypted to in
+`/etc/server-backup/age-recipients.txt`, one per line. Only the public keys go on the
+server. Without this file every encrypted backup fails.
+
+```sh
+sudo install -d -m 0755 /etc/server-backup
+sudo install -m 0644 age-recipients.txt /etc/server-backup/age-recipients.txt
 ```
 
 Make unattended-upgrades wait for any cleanup, backup or update that is running:
@@ -40,6 +50,12 @@ sudo systemctl daemon-reload
   | `server-backup-weekly` | GitLab | Sunday, 4:00 AM | 5 |
   | `server-backup-vaultwarden` | AMP (export only) | Daily, 3:30 AM | AMP decides |
 - A backup type that failed is not rotated that run.
+- Postgres, MariaDB, Vaultwarden, `/etc` and `/www` are compressed with zstd, then
+  encrypted with age to every key in `/etc/server-backup/age-recipients.txt`, and
+  saved as `.sql.zst.age` or `.tar.zst.age`. The server holds no private key, so it
+  cannot decrypt them. The compressed stream is checked with `zstd -t` as it is
+  written. GitLab and AMP backups are not encrypted. Older unencrypted backups rotate
+  out normally, counting toward the same limit.
 - `/opt/backup-management` is private to root. `backup-user` reads backups through
   the root-owned export directory.
 - GitLab backups are moved out of `/var/opt/gitlab/backups` rather than copied.
@@ -62,3 +78,14 @@ sudo systemctl daemon-reload
   `systemd/mastodon-clean.*` units, and enable the timer.
 
 Do not run the tests as root on a production host.
+
+## Restoring
+
+Decrypt with either private key, then decompress:
+
+```sh
+age -d -i ovhalpha-backup-age-key-primary.txt 20261109-120158+0000-postgres.sql.zst.age \
+    | zstd -d > postgres.sql
+age -d -i ovhalpha-backup-age-key-primary.txt 20261109-113001+0000-vaultwarden.tar.zst.age \
+    | zstd -d | tar -x -C restore/
+```

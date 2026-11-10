@@ -25,12 +25,35 @@ from server_backup_scripts.file_utils import (
     rotate_directory_backups,
 )
 from server_backup_scripts.process_utils import (
-    run_pipeline_to_zstd,
+    run_encrypted_pipeline,
     run_process_with_stdout,
 )
 
 MODULE = "server_backup_scripts.backup_server"
 OLD_TIME = 1000
+
+# A throwaway key pair, made once for the whole run
+_key_dir = None
+IDENTITY = None
+RECIPIENTS = None
+
+
+def setUpModule():
+    global _key_dir, IDENTITY, RECIPIENTS
+    _key_dir = tempfile.TemporaryDirectory()
+    IDENTITY = os.path.join(_key_dir.name, "identity.txt")
+    RECIPIENTS = os.path.join(_key_dir.name, "recipients.txt")
+    subprocess.run(["age-keygen", "-o", IDENTITY], capture_output=True, check=True)
+    with open(RECIPIENTS, "w") as f:
+        subprocess.run(["age-keygen", "-y", IDENTITY], stdout=f, check=True)
+
+
+def tearDownModule():
+    _key_dir.cleanup()
+
+
+def pipeline(producer, dest, **kwargs):
+    return run_encrypted_pipeline(producer, dest, RECIPIENTS, **kwargs)
 
 
 def write_file(path, content="data", mtime=None, mode=None):
@@ -50,13 +73,16 @@ def file_mode(path):
 
 def read_archive(path):
     return subprocess.run(
-        f"zstd -dc '{path}'", shell=True, capture_output=True, check=True
+        f"age -d -i '{IDENTITY}' '{path}' | zstd -dc",
+        shell=True,
+        capture_output=True,
+        check=True,
     ).stdout
 
 
 def archive_members(path):
     return subprocess.run(
-        f"zstd -dc '{path}' | tar -t",
+        f"age -d -i '{IDENTITY}' '{path}' | zstd -dc | tar -t",
         shell=True,
         capture_output=True,
         check=True,
@@ -117,6 +143,12 @@ class TestFileUtils(TempDirTestCase):
         path = write_file(os.path.join(self.root, "old.sqlite3.bz2"))
         self.assertEqual(get_backup_files(self.root), [path])
 
+    def test_plain_and_encrypted_backups_rotate_together(self):
+        plain = write_file(os.path.join(self.root, "a.sql.zst"), mtime=OLD_TIME)
+        encrypted = write_file(os.path.join(self.root, "b.sql.zst.age"))
+        self.assertEqual(rotate_directory_backups(self.root, 1), [plain])
+        self.assertEqual(get_backup_files(self.root), [encrypted])
+
     def test_remove_stale_temp_files(self):
         stale = write_file(os.path.join(self.root, "a.sql.zst.tmp"))
         kept = write_file(os.path.join(self.root, "b.sql.zst"))
@@ -138,29 +170,71 @@ class TestFileUtils(TempDirTestCase):
 class TestProcessUtils(TempDirTestCase):
     def setUp(self):
         super().setUp()
-        self.dest = os.path.join(self.root, "out.sql.zst")
+        self.dest = os.path.join(self.root, "out.sql.zst.age")
 
     def test_pipeline_writes_private_verified_archive(self):
-        self.assertTrue(run_pipeline_to_zstd(["echo", "hello"], self.dest))
+        self.assertTrue(pipeline(["echo", "hello"], self.dest))
         self.assertEqual(read_archive(self.dest), b"hello\n")
         self.assertEqual(file_mode(self.dest), 0o600)
         self.assertFalse(os.path.exists(f"{self.dest}.tmp"))
 
+    def test_archive_is_unreadable_without_the_key(self):
+        self.assertTrue(pipeline(["echo", "secret"], self.dest))
+        with open(self.dest, "rb") as f:
+            content = f.read()
+        self.assertTrue(content.startswith(b"age-encryption.org/v1"))
+        self.assertNotIn(b"secret", content)
+        not_zstd = subprocess.run(["zstd", "-t", "-q", self.dest], capture_output=True)
+        self.assertNotEqual(not_zstd.returncode, 0)
+
+    def test_every_recipient_can_decrypt(self):
+        second = os.path.join(self.root, "second.txt")
+        subprocess.run(["age-keygen", "-o", second], capture_output=True, check=True)
+        both = os.path.join(self.root, "both.txt")
+        with open(both, "w") as f:
+            f.write(open(RECIPIENTS).read())
+            subprocess.run(["age-keygen", "-y", second], stdout=f, check=True)
+        self.assertTrue(run_encrypted_pipeline(["echo", "hi"], self.dest, both))
+        for identity in (IDENTITY, second):
+            out = subprocess.run(
+                f"age -d -i '{identity}' '{self.dest}' | zstd -dc",
+                shell=True,
+                capture_output=True,
+                check=True,
+            ).stdout
+            self.assertEqual(out, b"hi\n")
+
+    def test_missing_recipients_file_fails_and_writes_nothing(self):
+        self.assertFalse(
+            run_encrypted_pipeline(["echo", "x"], self.dest, "/no/such/recipients")
+        )
+        self.assertEqual(os.listdir(self.root), [])
+
+    def test_age_failure_is_a_failure(self):
+        self.fake_binary("age", "cat >/dev/null; exit 1")
+        self.assertFalse(pipeline(["echo", "data"], self.dest))
+        self.assertEqual(os.listdir(self.root), ["bin"])
+
+    def test_age_dying_early_does_not_hang(self):
+        self.fake_binary("age", "exit 1")
+        self.assertFalse(
+            pipeline(["head", "-c", "50000000", "/dev/urandom"], self.dest)
+        )
+        self.assertFalse(os.path.exists(self.dest))
+
     def test_producer_failure_leaves_nothing(self):
-        self.assertFalse(run_pipeline_to_zstd(["false"], self.dest))
+        self.assertFalse(pipeline(["false"], self.dest))
         self.assertEqual(os.listdir(self.root), [])
 
     def test_ok_codes_apply_to_producer(self):
         self.fake_binary("exit1", "echo data; exit 1")
-        self.assertFalse(run_pipeline_to_zstd(["exit1"], self.dest))
-        self.assertTrue(run_pipeline_to_zstd(["exit1"], self.dest, ok_codes=(0, 1)))
+        self.assertFalse(pipeline(["exit1"], self.dest))
+        self.assertTrue(pipeline(["exit1"], self.dest, ok_codes=(0, 1)))
         self.assertEqual(read_archive(self.dest), b"data\n")
 
     def test_zstd_exit_one_is_never_acceptable(self):
         self.fake_binary("zstd", "cat >/dev/null; echo partial; exit 1")
-        self.assertFalse(
-            run_pipeline_to_zstd(["echo", "data"], self.dest, ok_codes=(0, 1))
-        )
+        self.assertFalse(pipeline(["echo", "data"], self.dest, ok_codes=(0, 1)))
         self.assertFalse(os.path.exists(self.dest))
         self.assertFalse(os.path.exists(f"{self.dest}.tmp"))
 
@@ -169,16 +243,16 @@ class TestProcessUtils(TempDirTestCase):
             "zstd",
             'if [ "$1" = "-t" ]; then exit 1; fi; cat >/dev/null; echo garbage',
         )
-        self.assertFalse(run_pipeline_to_zstd(["echo", "data"], self.dest))
+        self.assertFalse(pipeline(["echo", "data"], self.dest))
         self.assertFalse(os.path.exists(self.dest))
 
     def test_missing_producer_fails_cleanly(self):
-        self.assertFalse(run_pipeline_to_zstd(["no-such-command-xyz"], self.dest))
+        self.assertFalse(pipeline(["no-such-command-xyz"], self.dest))
         self.assertEqual(os.listdir(self.root), [])
 
     def test_shell_metacharacters_are_not_interpreted(self):
         dest = os.path.join(self.root, "a b; touch pwned.zst")
-        self.assertTrue(run_pipeline_to_zstd(["echo", "x"], dest))
+        self.assertTrue(pipeline(["echo", "x"], dest))
         self.assertTrue(os.path.exists(dest))
 
     def test_missing_command_returns_127(self):
@@ -194,7 +268,7 @@ class TestProcessUtils(TempDirTestCase):
 class TestCollectors(TempDirTestCase):
     def setUp(self):
         super().setUp()
-        self.collector = Collect(backup_dir=self.backup_dir)
+        self.collector = Collect(backup_dir=self.backup_dir, recipients_file=RECIPIENTS)
         self.collector.prepare()
 
     def test_prepare_creates_private_dirs(self):
@@ -224,7 +298,7 @@ class TestCollectors(TempDirTestCase):
         self.assertFalse(os.path.exists(stale))
 
     @patch(f"{MODULE}.shutil.which", return_value="/usr/bin/mariadb-dump")
-    @patch(f"{MODULE}.run_pipeline_to_zstd", return_value=True)
+    @patch(f"{MODULE}.run_encrypted_pipeline", return_value=True)
     def test_mariadb_collector(self, mock_pipeline, _which):
         self.assertIs(self.collector.mariadb(), CollectResult.OK)
         self.assertEqual(
@@ -233,7 +307,7 @@ class TestCollectors(TempDirTestCase):
         )
 
     @patch(f"{MODULE}.shutil.which", return_value="/usr/bin/pg_dumpall")
-    @patch(f"{MODULE}.run_pipeline_to_zstd", return_value=False)
+    @patch(f"{MODULE}.run_encrypted_pipeline", return_value=False)
     def test_postgres_failure_is_reported(self, mock_pipeline, _which):
         self.assertIs(self.collector.postgres(), CollectResult.FAILED)
         self.assertEqual(
@@ -304,7 +378,7 @@ class TestCollectors(TempDirTestCase):
 class TestGitlabCollector(TempDirTestCase):
     def setUp(self):
         super().setUp()
-        self.collector = Collect(backup_dir=self.backup_dir)
+        self.collector = Collect(backup_dir=self.backup_dir, recipients_file=RECIPIENTS)
         self.collector.prepare()
         self.gitlab_dir = os.path.join(self.root, "gitlab_src")
         self.old = write_file(
@@ -352,7 +426,7 @@ class TestGitlabCollector(TempDirTestCase):
 class TestVaultwardenCollector(TempDirTestCase):
     def setUp(self):
         super().setUp()
-        self.collector = Collect(backup_dir=self.backup_dir)
+        self.collector = Collect(backup_dir=self.backup_dir, recipients_file=RECIPIENTS)
         self.collector.prepare()
         self.vw_dir = os.path.join(self.root, "vw-data")
         self.live_db = write_file(os.path.join(self.vw_dir, "db.sqlite3"), "LIVE")

@@ -21,12 +21,14 @@ from .file_utils import (
     remove_stale_temp_files,
     rotate_directory_backups,
 )
-from .process_utils import run_pipeline_to_zstd, run_process_with_stdout
+from .process_utils import run_encrypted_pipeline, run_process_with_stdout
 
 DEFAULT_BACKUP_DIR: str = "/opt/backup-management"
 DEFAULT_EXPORT_DIR: str = "/home/backup-user/backups"
 DEFAULT_EXPORT_USER: str = "backup-user"
 DEFAULT_AMP_DIR: str = "/home/amp/.ampdata/instances"
+# Public keys only. The private keys are kept off this host, so it cannot decrypt.
+DEFAULT_AGE_RECIPIENTS: str = "/etc/server-backup/age-recipients.txt"
 GITLAB_BACKUP_DIR: str = "/var/opt/gitlab/backups"
 GITLAB_BACKUP_COMMAND: str = "/opt/gitlab/bin/gitlab-backup"
 VAULTWARDEN_BACKUP_DIR: str = "/opt/docker/vaultwarden/vw-data"
@@ -111,6 +113,12 @@ def get_datetime_str() -> str:
     help="Path to AMP instances directory, exported but never rotated",
 )
 @click.option(
+    "--age-recipients",
+    type=click.Path(),
+    default=DEFAULT_AGE_RECIPIENTS,
+    help="age recipients file with the public keys that backups are encrypted to",
+)
+@click.option(
     "--skip-collect",
     is_flag=True,
     default=False,
@@ -124,6 +132,7 @@ def main(
     keep: Optional[int],
     only: tuple[str, ...],
     amp_dir: str,
+    age_recipients: str,
     skip_collect: bool,
 ):
     make_private_dir(backup_dir)
@@ -135,7 +144,9 @@ def main(
     failures: list[str] = []
     failed_types: list[str] = []
     if not skip_collect:
-        failed_types = Collect(backup_dir=backup_dir).collect_all(types)
+        failed_types = Collect(
+            backup_dir=backup_dir, recipients_file=age_recipients
+        ).collect_all(types)
         failures.extend(failed_types)
 
     # A type that failed keeps all its backups until it next succeeds.
@@ -169,9 +180,15 @@ def _run_step(name: str, step: Callable[[], object]) -> bool:
 
 class Collect:
     backup_dir: str
+    recipients_file: str
 
-    def __init__(self, backup_dir: str = DEFAULT_BACKUP_DIR):
+    def __init__(
+        self,
+        backup_dir: str = DEFAULT_BACKUP_DIR,
+        recipients_file: str = DEFAULT_AGE_RECIPIENTS,
+    ):
         self.backup_dir = backup_dir
+        self.recipients_file = recipients_file
 
     def prepare(self) -> None:
         """Create private type directories and clear leftovers from earlier runs."""
@@ -270,9 +287,11 @@ class Collect:
             logger.warning("pg_dumpall not found, skipping PostgreSQL")
             return CollectResult.SKIPPED
 
-        backup_location = self._archive_path("postgres", ".sql.zst")
-        if run_pipeline_to_zstd(
-            ["sudo", "-u", "postgres", "pg_dumpall"], backup_location
+        backup_location = self._archive_path("postgres", ".sql.zst.age")
+        if run_encrypted_pipeline(
+            ["sudo", "-u", "postgres", "pg_dumpall"],
+            backup_location,
+            self.recipients_file,
         ):
             logger.info(f"Wrote postgres backup to {backup_location}")
             return CollectResult.OK
@@ -325,10 +344,11 @@ class Collect:
                 sorted(glob.glob("rsa_key*", root_dir=VAULTWARDEN_BACKUP_DIR))
             )
 
-            backup_location = self._archive_path("vaultwarden", ".tar.zst")
-            if run_pipeline_to_zstd(
+            backup_location = self._archive_path("vaultwarden", ".tar.zst.age")
+            if run_encrypted_pipeline(
                 ["tar", "-c", f"--directory={VAULTWARDEN_BACKUP_DIR}", *members],
                 backup_location,
+                self.recipients_file,
                 ok_codes=TAR_OK_CODES,
             ):
                 logger.info(f"Backed up Vaultwarden to {backup_location}")
@@ -347,7 +367,7 @@ class Collect:
         self, target_dir: str, backup_type: Optional[str] = None
     ) -> CollectResult:
         """
-        Archive a directory using tar and zstd compression.
+        Archive a directory using tar, zstd compression and age encryption.
         """
         b_type = (
             backup_type
@@ -364,13 +384,14 @@ class Collect:
             logger.warning(f"Directory {target_dir} does not exist, skipping {b_type}")
             return CollectResult.SKIPPED
 
-        backup_location = self._archive_path(b_type, ".tar.zst")
+        backup_location = self._archive_path(b_type, ".tar.zst.age")
         parent_dir = os.path.dirname(os.path.abspath(target_dir))
         dir_name = os.path.basename(os.path.abspath(target_dir))
 
-        if run_pipeline_to_zstd(
+        if run_encrypted_pipeline(
             ["tar", "-c", "-C", parent_dir, dir_name],
             backup_location,
+            self.recipients_file,
             ok_codes=TAR_OK_CODES,
         ):
             logger.info(f"Backed up {target_dir} to {backup_location}")
@@ -397,10 +418,11 @@ class Collect:
             logger.warning("mariadb-dump or mysqldump not found, skipping MariaDB")
             return CollectResult.SKIPPED
 
-        backup_location = self._archive_path("mariadb", ".sql.zst")
-        if run_pipeline_to_zstd(
+        backup_location = self._archive_path("mariadb", ".sql.zst.age")
+        if run_encrypted_pipeline(
             [dump_tool, "--all-databases", "--single-transaction", "--quick"],
             backup_location,
+            self.recipients_file,
         ):
             logger.info(f"Wrote MariaDB backup to {backup_location}")
             return CollectResult.OK
