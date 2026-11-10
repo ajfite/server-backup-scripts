@@ -17,6 +17,15 @@ sudo systemctl enable --now server-backup-vaultwarden.timer server-backup-databa
     server-backup-weekly.timer server-update.timer
 ```
 
+Make unattended-upgrades wait for any cleanup, backup or update that is running:
+
+```sh
+sudo mkdir -p /etc/systemd/system/apt-daily-upgrade.service.d
+sudo cp systemd/apt-daily-upgrade.service.d/wait-for-maintenance.conf \
+    /etc/systemd/system/apt-daily-upgrade.service.d/
+sudo systemctl daemon-reload
+```
+
 ## Behaviour
 
 - `backup` exits non-zero if any collector, rotation or export step fails, so the
