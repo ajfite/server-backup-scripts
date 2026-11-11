@@ -143,6 +143,10 @@ class TestFileUtils(TempDirTestCase):
         path = write_file(os.path.join(self.root, "old.sqlite3.bz2"))
         self.assertEqual(get_backup_files(self.root), [path])
 
+    def test_encrypted_old_snapshots_can_rotate(self):
+        path = write_file(os.path.join(self.root, "old.sqlite3.zst.age"))
+        self.assertEqual(get_backup_files(self.root), [path])
+
     def test_plain_and_encrypted_backups_rotate_together(self):
         plain = write_file(os.path.join(self.root, "a.sql.zst"), mtime=OLD_TIME)
         encrypted = write_file(os.path.join(self.root, "b.sql.zst.age"))

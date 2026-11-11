@@ -27,6 +27,8 @@ DEFAULT_BACKUP_EXTENSIONS = (
     ".sqlite3",
     ".sqlite3.bz2",
     ".sqlite3.zst",
+    # An old standalone Vaultwarden snapshot that was encrypted in place
+    ".sqlite3.zst.age",
     ".zip",
 )
 
